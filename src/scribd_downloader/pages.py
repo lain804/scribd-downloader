@@ -332,6 +332,13 @@ def _render_and_save(page: Page, assets: dict[str, bytes], path: Path) -> Path:
 
 
 async def _pass_client_challenge(url: str, timeout: int) -> dict[str, str]:
+    # Scrapling's Python extra does not include its browser binaries. Install
+    # them on demand before opening the headless browser. This is the same
+    # installer exposed by the `scrapling install` command.
+    from scrapling.cli import install
+
+    install([], standalone_mode=False)
+
     cookies: list[dict] = []
 
     async def wait_for_challenge(page):

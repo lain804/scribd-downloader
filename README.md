@@ -19,7 +19,7 @@ uv tool install git+https://github.com/lain804/scribd-downloader.git
 ## Usage
 
 ```sh
-scribd-downloader https://www.scribd.com/document/55026066/Some-Title
+scribd-downloader https://www.scribd.com/document/document-id/some-title
 ```
 
 By default, the PDF is saved in the current directory using the document title
@@ -28,11 +28,9 @@ output path, add it after the Scribd URL. Use `-v` to show progress. Pages are
 rendered at the maximum available output resolution.
 
 ```sh
-scribd-downloader <scribd-url> document.pdf
+scribd-downloader [scribd-url]
 ```
 
-The first install also needs Scrapling's headless browser dependencies:
-
-```sh
-scrapling install
-```
+If Scribd presents a browser challenge, the downloader automatically installs
+Scrapling's headless browser dependencies the first time they are needed. This
+may take a few minutes; later runs reuse the installed browsers.
