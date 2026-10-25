@@ -1,0 +1,28 @@
+[project]
+name = "scribd-downloader"
+version = "0.1.0"
+description = "Download and assemble Scribd document image chunks without a browser"
+readme = "README.md"
+authors = [
+    { name = "lain", email = "lain" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "img2pdf>=0.6.3",
+    "curl-cffi>=0.16.3",
+    "lxml>=6.1.3",
+    "pillow>=12.0.0",
+    "pypdf>=6.0.0",
+    "quickjs-ng>=0.17.0.2",
+    "reportlab>=4.4.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
+
+[project.scripts]
+scribd-downloader = "scribd_downloader.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
