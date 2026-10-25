@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-from pathlib import Path
 
 from scribd_downloader.cli import build_parser
 from scribd_downloader.constants import DOCUMENT_ID_SEARCH_PATTERN
@@ -24,15 +23,15 @@ def main():
     document_id = extract_document_id(args.url)
     if document_id is None:
         parser.error("Expected a Scribd /document/<id> or /doc/<id> URL")
-    output = args.output or Path("output/pdf") / f"{document_id}.pdf"
     try:
         count = asyncio.run(download_pdf(
-            f"https://www.scribd.com/embeds/{document_id}/content", output, scale=args.scale,
+            f"https://www.scribd.com/embeds/{document_id}/content", args.output,
         ))
     except Exception as exc:
         logging.error("Download failed: %s", exc)
         raise SystemExit(1) from exc
-    print(f"Saved {output} ({count} pages)")
+    destination = args.output if args.output is not None else "PDF in current directory"
+    print(f"Saved {destination} ({count} pages)")
 
 
 if __name__ == "__main__":

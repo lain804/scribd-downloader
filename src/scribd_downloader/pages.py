@@ -18,6 +18,7 @@ from lxml import html
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen.canvas import Canvas
+from scrapling.fetchers import AsyncDynamicSession
 
 from .extractor import extract_embed_data
 
@@ -25,7 +26,17 @@ from .extractor import extract_embed_data
 logger = logging.getLogger(__name__)
 MAX_CONCURRENCY = 16
 VIEWER_WIDTH = 1000
+OUTPUT_SCALE = 3
 JSONP = re.compile(r"\s*(?:window\.)?page(\d+)_callback\s*\((\[.*\])\)\s*;?\s*", re.S)
+CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
+INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _default_output_path(title: str) -> Path:
+    filename = INVALID_FILENAME_CHARACTERS.sub("_", str(title or "")).strip().rstrip(".")
+    if not filename or filename in {".", ".."}:
+        filename = "document"
+    return Path.cwd() / f"{filename}.pdf"
 
 
 @dataclass(frozen=True)
@@ -172,10 +183,11 @@ def parse_page(root, number: int, base_url: str) -> Page:
     return Page(number, width, height, tuple(placements), tuple(text_runs))
 
 
-def _merge_searchable_text(pdf_path: Path, pages: list[Page]) -> None:
+def _merge_searchable_text(pdf_path: Path, pages: list[Page], title: str = "") -> None:
     """Render Scribd's text layer over each page and keep it searchable."""
     reader = PdfReader(str(pdf_path))
     writer = PdfWriter()
+    writer.add_metadata({"/Title": title})
     for pdf_page, page in zip(reader.pages, pages, strict=True):
         if not page.text_runs:
             writer.add_page(pdf_page)
@@ -274,7 +286,7 @@ def _decode_asset(contents: bytes, url: str) -> Image.Image:
         raise ValueError(f"Could not decode image {url}: {exc}") from exc
 
 
-def render_page(page: Page, assets: dict[str, bytes], scale: int = 2) -> Image.Image:
+def render_page(page: Page, assets: dict[str, bytes]) -> Image.Image:
     canvas = Image.new("RGB", (round(page.width), round(page.height)), "white")
     decoded = {}
     try:
@@ -298,8 +310,8 @@ def render_page(page: Page, assets: dict[str, bytes], scale: int = 2) -> Image.I
                 piece.close()
             if resized is not image:
                 resized.close()
-        output_width = VIEWER_WIDTH * scale
-        output_height = round(page.height * VIEWER_WIDTH / page.width * scale) + 2
+        output_width = VIEWER_WIDTH * OUTPUT_SCALE
+        output_height = round(page.height * VIEWER_WIDTH / page.width * OUTPUT_SCALE) + 2
         result = canvas.resize((output_width, output_height), Image.Resampling.BILINEAR)
         return result
     except Exception as exc:
@@ -310,8 +322,8 @@ def render_page(page: Page, assets: dict[str, bytes], scale: int = 2) -> Image.I
             image.close()
 
 
-def _render_and_save(page: Page, assets: dict[str, bytes], scale: int, path: Path) -> Path:
-    image = render_page(page, assets, scale)
+def _render_and_save(page: Page, assets: dict[str, bytes], path: Path) -> Path:
+    image = render_page(page, assets)
     try:
         image.save(path, format="PNG", compress_level=3)
     finally:
@@ -319,9 +331,30 @@ def _render_and_save(page: Page, assets: dict[str, bytes], scale: int, path: Pat
     return path
 
 
-async def download_pdf(url: str, output: Path, scale: int = 2, timeout: int = 30) -> int:
-    if scale not in (1, 2, 3):
-        raise ValueError("scale must be 1, 2, or 3")
+async def _pass_client_challenge(url: str, timeout: int) -> dict[str, str]:
+    cookies: list[dict] = []
+
+    async def wait_for_challenge(page):
+        await page.wait_for_function(
+            "document.title !== 'Client Challenge'",
+            timeout=timeout * 1000,
+        )
+        cookies.extend(await page.context.cookies())
+
+    async with AsyncDynamicSession(
+        headless=True, network_idle=True, timeout=timeout * 1000, max_pages=1,
+    ) as browser:
+        await browser.fetch(
+            url, page_action=wait_for_challenge, google_search=False,
+        )
+    return {
+        cookie["name"]: cookie["value"]
+        for cookie in cookies
+        if cookie.get("domain", "").lstrip(".").endswith("scribd.com")
+    }
+
+
+async def download_pdf(url: str, output: Path | None = None, timeout: int = 30) -> int:
     started = perf_counter()
     request_headers = {
         "Referer": url,
@@ -331,17 +364,21 @@ async def download_pdf(url: str, output: Path, scale: int = 2, timeout: int = 30
         impersonate="chrome", timeout=timeout, max_clients=MAX_CONCURRENCY, headers=request_headers,
     ) as session:
         embed_response = await session.get(url)
+        if CLIENT_CHALLENGE in embed_response.content:
+            challenge_cookies = await _pass_client_challenge(url, timeout)
+            session.cookies.update(challenge_cookies)
+            embed_response = await session.get(url)
+            if CLIENT_CHALLENGE in embed_response.content:
+                raise RuntimeError("Scribd's browser challenge did not complete successfully")
         embed_response.raise_for_status()
-        if b"<title>Client Challenge</title>" in embed_response.content:
-            raise RuntimeError(
-                "Scribd returned a JavaScript client challenge for the document manifest; "
-                "this request-only downloader cannot retrieve page metadata from this network."
-            )
         try:
             root = html.fromstring(embed_response.content)
             options, metadata = extract_embed_data(root)
         except Exception as exc:
             raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc
+        document_title = str(options["document"].get("title") or "")
+        if output is None:
+            output = _default_output_path(document_title)
         count = options["document"]["page_count"]
         pages = await _fetch_pages(session, root, metadata, count, url)
         unique_urls = list(dict.fromkeys(item.url for page in pages for item in page.placements))
@@ -363,7 +400,7 @@ async def download_pdf(url: str, output: Path, scale: int = 2, timeout: int = 30
     with TemporaryDirectory(prefix="scribd-", dir=output.parent) as temporary:
         directory = Path(temporary)
         jobs = (
-            (page, assets, scale, directory / f"page-{page.number:05}.png")
+            (page, assets, directory / f"page-{page.number:05}.png")
             for page in pages
         )
         workers = min(4, len(pages))
@@ -374,10 +411,10 @@ async def download_pdf(url: str, output: Path, scale: int = 2, timeout: int = 30
             img2pdf.convert(
                 [str(path) for path in paths],
                 outputstream=stream,
-                layout_fun=img2pdf.get_fixed_dpi_layout_fun((96 * scale, 96 * scale)),
-                title=options["document"].get("title", ""),
+                layout_fun=img2pdf.get_fixed_dpi_layout_fun((96 * OUTPUT_SCALE, 96 * OUTPUT_SCALE)),
+                title=document_title,
             )
-        _merge_searchable_text(staged, pages)
+        _merge_searchable_text(staged, pages, document_title)
         staged.replace(output)
     logger.info("Assembled %d page screenshots in %.2fs", count, perf_counter() - started)
     return count

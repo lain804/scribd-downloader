@@ -15,6 +15,7 @@ dependencies = [
     "pypdf>=6.0.0",
     "quickjs-ng>=0.17.0.2",
     "reportlab>=4.4.0",
+    "scrapling[fetchers]>=0.5",
 ]
 
 [dependency-groups]
