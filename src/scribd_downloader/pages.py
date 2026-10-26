@@ -8,6 +8,7 @@ import logging
 import math
 from pathlib import Path
 import re
+import sys
 from tempfile import TemporaryDirectory
 from time import perf_counter
 from urllib.parse import urljoin, urlsplit
@@ -18,7 +19,6 @@ from lxml import html
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen.canvas import Canvas
-from scrapling.fetchers import AsyncDynamicSession
 
 from .extractor import extract_embed_data
 
@@ -331,34 +331,66 @@ def _render_and_save(page: Page, assets: dict[str, bytes], path: Path) -> Path:
     return path
 
 
-async def _pass_client_challenge(url: str, timeout: int) -> dict[str, str]:
-    # Scrapling's Python extra does not include its browser binaries. Install
-    # them on demand before opening the headless browser. This is the same
-    # installer exposed by the `scrapling install` command.
-    from scrapling.cli import install
+async def _ensure_chromium() -> None:
+    from patchright.async_api import async_playwright
 
-    install([], standalone_mode=False)
+    # Check the browser revision required by Patchright, rather than relying
+    # on Scrapling's install marker or Playwright's potentially different revision.
+    async with async_playwright() as playwright:
+        if Path(playwright.chromium.executable_path).is_file():
+            return
+    logger.warning("Installing Chromium for Scribd's browser challenge; this may take a few minutes")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "patchright", "install", "chromium",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    if process.returncode:
+        raise RuntimeError(
+            "Could not install Chromium for the browser challenge: "
+            + output.decode("utf-8", errors="replace").strip()
+        )
 
-    cookies: list[dict] = []
+
+async def _pass_client_challenge(url: str, timeout: int) -> bytes:
+    from scrapling.fetchers import AsyncStealthySession
+
+    await _ensure_chromium()
+    responses = []
+
+    async def capture_navigation(page):
+        def capture(response):
+            if response.request.is_navigation_request() and response.frame == page.main_frame:
+                responses.append(response)
+
+        page.on("response", capture)
 
     async def wait_for_challenge(page):
         await page.wait_for_function(
             "document.title !== 'Client Challenge'",
             timeout=timeout * 1000,
         )
-        cookies.extend(await page.context.cookies())
 
-    async with AsyncDynamicSession(
-        headless=True, network_idle=True, timeout=timeout * 1000, max_pages=1,
+    async with AsyncStealthySession(
+        headless=True, disable_resources=True, network_idle=False,
+        timeout=timeout * 1000, max_pages=1, retries=1,
     ) as browser:
         await browser.fetch(
-            url, page_action=wait_for_challenge, google_search=False,
+            url, page_setup=capture_navigation, page_action=wait_for_challenge,
+            google_search=False,
         )
-    return {
-        cookie["name"]: cookie["value"]
-        for cookie in cookies
-        if cookie.get("domain", "").lstrip(".").endswith("scribd.com")
-    }
+        if not responses:
+            raise RuntimeError("Scribd's browser challenge returned no document response")
+        response = responses[-1]
+        # Use the original HTML: browser rendering mutates page dimensions and
+        # transforms. Replaying clearance cookies through curl can be challenged
+        # again because its browser fingerprint differs.
+        contents = await response.body()
+        if CLIENT_CHALLENGE in contents:
+            raise RuntimeError("Scribd's browser challenge did not complete successfully")
+        if response.status >= 400:
+            raise RuntimeError(f"Scribd returned HTTP {response.status} after the browser challenge")
+        return contents
 
 
 async def download_pdf(url: str, output: Path | None = None, timeout: int = 30) -> int:
@@ -371,15 +403,14 @@ async def download_pdf(url: str, output: Path | None = None, timeout: int = 30) 
         impersonate="chrome", timeout=timeout, max_clients=MAX_CONCURRENCY, headers=request_headers,
     ) as session:
         embed_response = await session.get(url)
-        if CLIENT_CHALLENGE in embed_response.content:
-            challenge_cookies = await _pass_client_challenge(url, timeout)
-            session.cookies.update(challenge_cookies)
-            embed_response = await session.get(url)
-            if CLIENT_CHALLENGE in embed_response.content:
-                raise RuntimeError("Scribd's browser challenge did not complete successfully")
-        embed_response.raise_for_status()
+        embed_contents = embed_response.content
+        if CLIENT_CHALLENGE in embed_contents:
+            logger.info("Scribd requires a browser challenge; opening headless Chromium")
+            embed_contents = await _pass_client_challenge(url, timeout)
+        else:
+            embed_response.raise_for_status()
         try:
-            root = html.fromstring(embed_response.content)
+            root = html.fromstring(embed_contents)
             options, metadata = extract_embed_data(root)
         except Exception as exc:
             raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc

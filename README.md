@@ -16,6 +16,13 @@ With uv:
 uv tool install git+https://github.com/lain804/scribd-downloader.git
 ```
 
+To install this checkout as a tool and use local fixes immediately, run from
+the project directory:
+
+```sh
+uv tool install --force --editable .
+```
+
 ## Usage
 
 ```sh
@@ -31,6 +38,12 @@ rendered at the maximum available output resolution.
 scribd-downloader [scribd-url]
 ```
 
-If Scribd presents a browser challenge, the downloader automatically installs
-Scrapling's headless browser dependencies the first time they are needed. This
-may take a few minutes; later runs reuse the installed browsers.
+If Scribd presents a browser challenge, the downloader loads the document in
+headless Chromium, then downloads the page images directly. The Chromium version
+required by the browser backend is installed automatically the first time it is
+needed. This may take a few minutes; later runs reuse the installed browser.
+
+## Development
+
+Run the regression tests with `uv run pytest`. They use a local document server
+and simulated browser challenges, so they do not require access to Scribd.
