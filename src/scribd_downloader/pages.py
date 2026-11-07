@@ -1,6 +1,5 @@
-"""Download Scribd page chunks and composite their clipped image pieces."""
+"""Download Scribd page chunks and place their original images in a PDF."""
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 import json
@@ -17,7 +16,7 @@ import img2pdf
 from curl_cffi.requests import AsyncSession
 from lxml import html
 from PIL import Image
-from pypdf import PdfReader, PdfWriter
+import pikepdf
 from reportlab.pdfgen.canvas import Canvas
 
 from .extractor import extract_embed_data
@@ -26,7 +25,6 @@ from .extractor import extract_embed_data
 logger = logging.getLogger(__name__)
 MAX_CONCURRENCY = 16
 VIEWER_WIDTH = 1000
-OUTPUT_SCALE = 3
 JSONP = re.compile(r"\s*(?:window\.)?page(\d+)_callback\s*\((\[.*\])\)\s*;?\s*", re.S)
 CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
 INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -57,7 +55,7 @@ class Page:
     width: float
     height: float
     placements: tuple[Placement, ...]
-    text_runs: tuple[tuple[float, float, float, tuple[float, float, float], str], ...]
+    text_runs: tuple[tuple[float, float, float, tuple[float, float, float] | None, str], ...]
 
 
 def _style(node) -> dict[str, str]:
@@ -78,10 +76,12 @@ def _pixels(value: str) -> float:
     return result
 
 
-def _text_color(value: str | None) -> tuple[float, float, float]:
+def _text_color(value: str | None) -> tuple[float, float, float] | None:
     if not value:
         return (0.0, 0.0, 0.0)
     value = value.strip().lower()
+    if value == "transparent":
+        return None
     if value == "white":
         return (1.0, 1.0, 1.0)
     if value == "black":
@@ -100,8 +100,7 @@ def _text_color(value: str | None) -> tuple[float, float, float]:
 
 def _image_url(base: str, value: str) -> str:
     url = urljoin(base, value)
-    # Scribd's browser viewer substitutes this CDN host. It negotiates WebP
-    # when the request advertises the same image formats as Chromium.
+    # Scribd's browser viewer substitutes this CDN host.
     if url.startswith("http://html.scribd.com/"):
         url = url.replace("http://html.scribd.com/", "https://html.scribdassets.com/", 1)
     if urlsplit(url).scheme not in {"https", "http"}:
@@ -120,9 +119,8 @@ def parse_page(root, number: int, base_url: str) -> Page:
         raise ValueError(f"Page {number}: invalid or oversized canvas {width} x {height}")
     if css.get("transform", "none") != "none":
         raise ValueError(f"Page {number}: transformed page canvases are unsupported")
-    # Scribd adds an invisible, selectable text overlay to many otherwise
-    # image-backed pages. The PDF output is reconstructed from the image
-    # placements below, so this overlay does not need to be rendered.
+    # Pages can combine visible HTML text, image segments and transparent text
+    # overlays. Retain text visibility rather than assuming images contain it.
     if page.xpath(".//canvas | .//svg"):
         raise ValueError(f"Page {number}: canvas/SVG page content is unsupported")
     text_runs = []
@@ -136,22 +134,16 @@ def parse_page(root, number: int, base_url: str) -> Page:
             text = "".join(span.itertext()).replace("\ufffd", "")
             if not text.strip():
                 continue
-            font_size = 0.0
-            for ancestor in span.iterancestors():
-                value = _style(ancestor).get("font-size")
-                if value:
-                    font_size = _pixels(value)
-                    break
+            inherited = [style, *(_style(node) for node in span.iterancestors())]
+            font_size = _pixels(next((css["font-size"] for css in inherited if css.get("font-size")), "0"))
             if font_size <= 0:
                 continue
-            color = None
-            for ancestor in span.iterancestors():
-                color = _style(ancestor).get("color")
-                if color:
-                    break
+            color = _text_color(next((css["color"] for css in inherited if css.get("color")), None))
+            if any(css.get("opacity") in {"0", "0.0", "0.00"} for css in inherited):
+                color = None
             text_runs.append((
                 _pixels(style["left"]), _pixels(style["top"]), font_size,
-                _text_color(style.get("color") or color), text,
+                color, text,
             ))
     placements = []
     for img in page.xpath(".//img[contains(concat(' ',normalize-space(@class),' '),' absimg ')]"):
@@ -180,43 +172,103 @@ def parse_page(root, number: int, base_url: str) -> Page:
         if style.get("transform", "none") != "none" or style.get("opacity", "1") != "1":
             raise ValueError(f"Page {number}: transformed or translucent image is unsupported")
         placements.append(Placement(_image_url(base_url, value), left, top, image_width, image_height, clip))
-    if not placements:
-        raise ValueError(f"Page {number}: no image segments were found")
+    if not placements and not text_runs:
+        raise ValueError(f"Page {number}: no image segments or supported text were found")
     return Page(number, width, height, tuple(placements), tuple(text_runs))
 
 
-def _merge_searchable_text(pdf_path: Path, pages: list[Page], title: str = "") -> None:
-    """Render Scribd's text layer over each page and keep it searchable."""
-    reader = PdfReader(str(pdf_path))
-    writer = PdfWriter()
-    writer.add_metadata({"/Title": title})
-    for pdf_page, page in zip(reader.pages, pages, strict=True):
-        if not page.text_runs:
-            writer.add_page(pdf_page)
-            continue
-        width = float(pdf_page.mediabox.width)
-        height = float(pdf_page.mediabox.height)
+def _text_pdf(pages: list[Page]) -> BytesIO:
+    """Create small PDF pages containing the visible and searchable HTML text."""
+    contents = BytesIO()
+    overlay = Canvas(contents, pageCompression=1)
+    for page in pages:
+        width = VIEWER_WIDTH * 72 / 96
+        height = page.height * width / page.width
+        overlay.setPageSize((width, height))
         scale = width / page.width * 0.2  # Scribd text layers use transform: scale(.2).
-        overlay_bytes = BytesIO()
-        overlay = Canvas(overlay_bytes, pagesize=(width, height), pageCompression=1)
+        obj = overlay.beginText()
+        previous_size = None
+        previous_color = object()
         for left, top, font_size, color, text in page.text_runs:
             # Helvetica uses WinAnsi; replace unsupported glyphs while keeping
             # the rest of the page's searchable text.
             text = text.encode("cp1252", "replace").decode("cp1252")
-            obj = overlay.beginText(left * scale, height - (top + font_size) * scale)
-            obj.setFont("Helvetica", font_size * scale)
-            obj.setFillColorRGB(*color)
-            obj.setTextRenderMode(0)
+            obj.setTextOrigin(left * scale, height - (top + font_size) * scale)
+            if font_size != previous_size:
+                obj.setFont("Helvetica", font_size * scale)
+                previous_size = font_size
+            if color != previous_color:
+                obj.setTextRenderMode(3 if color is None else 0)
+                if color is not None:
+                    obj.setFillColorRGB(*color)
+                previous_color = color
             obj.textOut(text)
-            overlay.drawText(obj)
-        overlay.save()
-        overlay_bytes.seek(0)
-        pdf_page.merge_page(PdfReader(overlay_bytes).pages[0])
-        writer.add_page(pdf_page)
-    searchable = pdf_path.with_name("document-searchable.pdf")
-    with searchable.open("wb") as stream:
-        writer.write(stream)
-    searchable.replace(pdf_path)
+        overlay.drawText(obj)
+        overlay.showPage()
+    overlay.save()
+    contents.seek(0)
+    return contents
+
+
+def _assemble_pdf(pages: list[Page], assets: dict[str, Path], directory: Path, title: str) -> Path:
+    """Embed each asset once, then reconstruct CSS clipping using PDF commands.
+
+    img2pdf preserves JPEG/PNG compression, bit depth, color profiles and alpha.
+    No page bitmap, upscaling, or lossy re-encoding is needed. pikepdf retains
+    the encoded streams and shared image objects while replacing their pages.
+    """
+    urls = list(assets)
+    staged = directory / "document.pdf"
+    if not urls:
+        with pikepdf.Pdf.open(_text_pdf(pages)) as document:
+            document.docinfo["/Title"] = title
+            document.save(staged, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        return staged
+    native = directory / "assets.pdf"
+    with native.open("wb") as stream:
+        img2pdf.convert(
+            [str(assets[url]) for url in urls], outputstream=stream,
+            engine=img2pdf.Engine.internal, rotation=img2pdf.Rotation.none,
+            first_frame_only=True, title=title,
+        )
+    with pikepdf.Pdf.open(native) as document, pikepdf.Pdf.open(_text_pdf(pages)) as text:
+        images = {
+            url: asset_page.Resources.XObject.Im0
+            for url, asset_page in zip(urls, document.pages, strict=True)
+        }
+        for page, text_page in zip(pages, text.pages, strict=True):
+            document.pages.append(text_page)
+            pdf_page = document.pages[-1]
+            resources = pikepdf.Dictionary()
+            names = {}
+            scale = VIEWER_WIDTH * 72 / 96 / page.width
+            commands = [f"q {scale:.9f} 0 0 {scale:.9f} 0 0 cm"]
+            for placement in page.placements:
+                top, right, bottom, left = placement.clip
+                # Intersect CSS clipping with the image and page boundaries.
+                left = max(0, left, -placement.left)
+                top = max(0, top, -placement.top)
+                right = min(placement.width, right, page.width - placement.left)
+                bottom = min(placement.height, bottom, page.height - placement.top)
+                if right <= left or bottom <= top:
+                    continue
+                if placement.url not in names:
+                    names[placement.url] = f"/Im{len(names)}"
+                    resources[names[placement.url]] = images[placement.url]
+                name = names[placement.url]
+                commands.append(
+                    f"q {placement.left + left:.6f} {page.height - placement.top - bottom:.6f} "
+                    f"{right - left:.6f} {bottom - top:.6f} re W n "
+                    f"{placement.width:.6f} 0 0 {placement.height:.6f} "
+                    f"{placement.left:.6f} {page.height - placement.top - placement.height:.6f} cm "
+                    f"{name} Do Q"
+                )
+            commands.append("Q")
+            pdf_page.Resources.XObject = resources
+            pdf_page.contents_add(pikepdf.Stream(document, "\n".join(commands).encode("ascii")), prepend=True)
+        del document.pages[:len(urls)]
+        document.save(staged, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    return staged
 
 
 def _parse_jsonp(source: str, number: int):
@@ -274,63 +326,14 @@ async def _fetch_pages(session: AsyncSession, root, metadata, count: int, base_u
     return pages
 
 
-def _decode_asset(contents: bytes, url: str) -> Image.Image:
+def _validate_asset(contents: bytes, url: str) -> None:
     try:
-        source = Image.open(BytesIO(contents))
-        source.load()
-        image = source.convert("RGB")
-        source.close()
-        if image.width * image.height > 40_000_000:
-            image.close()
-            raise ValueError(f"Image is too large: {url}")
-        return image
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"Could not decode image {url}: {exc}") from exc
-
-
-def render_page(page: Page, assets: dict[str, bytes]) -> Image.Image:
-    canvas = Image.new("RGB", (round(page.width), round(page.height)), "white")
-    decoded = {}
-    try:
-        for placement in page.placements:
-            if placement.url not in decoded:
-                decoded[placement.url] = _decode_asset(assets[placement.url], placement.url)
-            image = decoded[placement.url]
-            display_size = (round(placement.width), round(placement.height))
-            if image.size != display_size:
-                resized = image.resize(display_size, Image.Resampling.BILINEAR)
-            else:
-                resized = image
-            top, right, bottom, left = placement.clip
-            crop = (
-                max(0, round(left)), max(0, round(top)),
-                min(resized.width, round(right)), min(resized.height, round(bottom)),
-            )
-            if crop[2] > crop[0] and crop[3] > crop[1]:
-                piece = resized.crop(crop)
-                canvas.paste(piece, (round(placement.left + left), round(placement.top + top)))
-                piece.close()
-            if resized is not image:
-                resized.close()
-        output_width = VIEWER_WIDTH * OUTPUT_SCALE
-        output_height = round(page.height * VIEWER_WIDTH / page.width * OUTPUT_SCALE) + 2
-        result = canvas.resize((output_width, output_height), Image.Resampling.BILINEAR)
-        return result
-    except Exception as exc:
-        canvas.close()
-        raise RuntimeError(f"Page {page.number}: could not assemble image segments: {exc}") from exc
-    finally:
-        for image in decoded.values():
-            image.close()
-
-
-def _render_and_save(page: Page, assets: dict[str, bytes], path: Path) -> Path:
-    image = render_page(page, assets)
-    try:
-        image.save(path, format="PNG", compress_level=3)
-    finally:
-        image.close()
-    return path
+        with Image.open(BytesIO(contents)) as image:
+            # Check headers before any pixel decoding/allocation.
+            if image.width * image.height > 40_000_000:
+                raise ValueError("image exceeds 40 million pixels")
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ValueError(f"Could not read image {url}: {exc}") from exc
 
 
 async def _ensure_chromium() -> None:
@@ -439,22 +442,13 @@ async def download_pdf(url: str, output: Path | None = None, timeout: int = 30) 
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="scribd-", dir=output.parent) as temporary:
         directory = Path(temporary)
-        jobs = (
-            (page, assets, directory / f"page-{page.number:05}.png")
-            for page in pages
-        )
-        workers = min(4, len(pages))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            paths = list(executor.map(lambda job: _render_and_save(*job), jobs))
-        staged = directory / "document.pdf"
-        with staged.open("wb") as stream:
-            img2pdf.convert(
-                [str(path) for path in paths],
-                outputstream=stream,
-                layout_fun=img2pdf.get_fixed_dpi_layout_fun((96 * OUTPUT_SCALE, 96 * OUTPUT_SCALE)),
-                title=document_title,
-            )
-        _merge_searchable_text(staged, pages, document_title)
+        paths = {}
+        for number, (asset_url, contents) in enumerate(assets.items()):
+            _validate_asset(contents, asset_url)
+            path = directory / f"asset-{number:06d}.image"
+            path.write_bytes(contents)
+            paths[asset_url] = path
+        staged = _assemble_pdf(pages, paths, directory, document_title)
         staged.replace(output)
-    logger.info("Assembled %d page screenshots in %.2fs", count, perf_counter() - started)
+    logger.info("Assembled %d pages in %.2fs", count, perf_counter() - started)
     return count

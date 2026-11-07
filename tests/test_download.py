@@ -86,7 +86,6 @@ def test_download_assembles_all_pages_without_replaying_challenge(
 
     monkeypatch.setattr(pages, "_pass_client_challenge", browser)
     monkeypatch.setattr(pages, "VIEWER_WIDTH", 40)
-    monkeypatch.setattr(pages, "OUTPUT_SCALE", 1)
     monkeypatch.chdir(tmp_path)
     count = asyncio.run(pages.download_pdf(state["url"]))
     output = tmp_path / "Test Manual.pdf"
@@ -126,6 +125,20 @@ def test_http_error_without_challenge_does_not_launch_browser(
     with pytest.raises(HTTPError, match="404"):
         asyncio.run(pages.download_pdf(document_server["url"], tmp_path / "missing.pdf"))
     assert not list(tmp_path.iterdir())
+
+
+def test_failed_assembly_preserves_output_and_removes_assets(monkeypatch, tmp_path, document_server):
+    output = tmp_path / "existing.pdf"
+    output.write_bytes(b"existing document")
+
+    def fail(*args):
+        raise RuntimeError("assembly failed")
+
+    monkeypatch.setattr(pages, "_assemble_pdf", fail)
+    with pytest.raises(RuntimeError, match="assembly failed"):
+        asyncio.run(pages.download_pdf(document_server["url"], output))
+    assert output.read_bytes() == b"existing document"
+    assert list(tmp_path.iterdir()) == [output]
 
 
 def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path):
