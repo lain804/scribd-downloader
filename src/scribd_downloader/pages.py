@@ -30,13 +30,22 @@ CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
 INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def _default_output_path(title: str) -> Path:
+def _default_output_path(title: str, directory: Path | None = None) -> Path:
     filename = INVALID_FILENAME_CHARACTERS.sub("_", str(title or "")).strip().rstrip(".")
     # Common filesystems limit each filename to 255 bytes, including '.pdf'.
     filename = filename.encode("utf-8", "replace")[:240].decode("utf-8", "ignore").rstrip(" .")
     if not filename or filename in {".", ".."}:
         filename = "document"
-    return Path.cwd() / f"{filename}.pdf"
+    return (Path(directory) if directory is not None else Path.cwd()) / f"{filename}.pdf"
+
+
+def _available_output_path(output: Path) -> Path:
+    candidate = output
+    number = 1
+    while candidate.exists():
+        candidate = output.with_name(f"{output.stem} ({number}){output.suffix}")
+        number += 1
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -462,7 +471,10 @@ async def _pass_client_challenge(url: str, timeout: int) -> bytes:
 async def download_pdf(
     url: str, output: Path | None = None, timeout: int = 30,
     *, concurrency: int = MAX_CONCURRENCY,
+    output_dir: Path | None = None, overwrite: bool = True,
 ) -> int:
+    if output is not None and output_dir is not None:
+        raise ValueError("Choose either an output PDF path or an output directory")
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 256:
         raise ValueError("Concurrency must be an integer between 1 and 256")
     started = perf_counter()
@@ -486,7 +498,7 @@ async def download_pdf(
         except Exception as exc:
             raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc
         document_title = str(options["document"].get("title") or "")
-        output = Path(output) if output is not None else _default_output_path(document_title)
+        output = Path(output) if output is not None else _default_output_path(document_title, output_dir)
         output.parent.mkdir(parents=True, exist_ok=True)
         count = options["document"]["page_count"]
         with TemporaryDirectory(prefix="scribd-", dir=output.parent) as temporary:
@@ -501,6 +513,8 @@ async def download_pdf(
             )
             staged = _assemble_pdf(pages, assets, directory, document_title)
             size = staged.stat().st_size
+            if not overwrite:
+                output = _available_output_path(output)
             staged.replace(output)
     logger.info(
         "Saved %s (%d pages, %.2f MiB); assembly %.2fs, total %.2fs",

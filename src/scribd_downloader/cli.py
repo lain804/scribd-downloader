@@ -17,7 +17,11 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Log download and assembly progress")
     parser.add_argument("-j", "--concurrency", type=_concurrency, default=32,
                         help="Maximum simultaneous HTTP requests (1-256, default: 32)")
-    parser.add_argument("url", help="Scribd /document/<id> or /doc/<id> URL")
+    parser.add_argument("-f", "--file", type=Path,
+                        help="UTF-8 file containing one Scribd URL per line")
+    parser.add_argument("-d", "--output-dir", type=Path,
+                        help="Save PDFs in this directory (default: current directory)")
+    parser.add_argument("url", nargs="?", help="Scribd /document/<id> or /doc/<id> URL")
     parser.add_argument("output", nargs="?", type=Path,
                         help="Output PDF path (default: <embed-title>.pdf in the current directory)")
     return parser

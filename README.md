@@ -40,6 +40,22 @@ Shared image chunks are stored once in the PDF, with their original clipping.
 scribd-downloader [scribd-url]
 ```
 
+Download a UTF-8 file containing one Scribd URL per line with `-f` / `--file`:
+
+```sh
+scribd-downloader -f links.txt
+scribd-downloader -f links.txt -d downloads
+```
+
+PDFs are saved in the current working directory by default. Use `-d` /
+`--output-dir` to choose a directory, including for a single URL. Directories
+are created as needed. Batch mode ignores blank lines and skips repeated
+document IDs. It preserves existing PDFs and adds a numeric suffix when titles
+collide, such as `Manual (1).pdf`. Invalid links and failed downloads are reported
+while the remaining links continue; the command exits with status 1 if any fail.
+Documents are processed in file order, each using the configured concurrent
+page/image requests.
+
 Downloads use up to 32 simultaneous requests by default. Page images start
 downloading as their page descriptions arrive. Change the shared request limit
 with `-j` / `--concurrency` (1–256):

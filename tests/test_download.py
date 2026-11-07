@@ -246,3 +246,27 @@ def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path
     output = pages._default_output_path("文" * 200)
     assert len(output.name.encode("utf-8")) <= 255
     output.touch()
+
+
+def test_output_directory_preserves_existing_pdfs_and_handles_repeated_titles(tmp_path, document_server):
+    directory = tmp_path / "downloads"
+    directory.mkdir()
+    original = directory / "Test Manual.pdf"
+    original.write_bytes(b"existing PDF")
+
+    async def run():
+        for _ in range(2):
+            await pages.download_pdf(document_server["url"], output_dir=directory, overwrite=False)
+
+    asyncio.run(run())
+    assert original.read_bytes() == b"existing PDF"
+    for name in ("Test Manual (1).pdf", "Test Manual (2).pdf"):
+        assert len(PdfReader(directory / name).pages) == 2
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "Test Manual (1).pdf", "Test Manual (2).pdf", "Test Manual.pdf",
+    ]
+
+
+def test_output_file_and_directory_are_mutually_exclusive(tmp_path):
+    with pytest.raises(ValueError, match="either an output PDF path or an output directory"):
+        asyncio.run(pages.download_pdf("https://example.com/", tmp_path / "file.pdf", output_dir=tmp_path))
