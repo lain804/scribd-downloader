@@ -26,6 +26,7 @@ def main():
     try:
         count = asyncio.run(download_pdf(
             f"https://www.scribd.com/embeds/{document_id}/content", args.output,
+            concurrency=args.concurrency,
         ))
     except Exception as exc:
         logging.error("Download failed: %s", exc)

@@ -2,9 +2,11 @@ import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
-from threading import Thread
+from threading import Lock, Thread
+from time import sleep
 
 from PIL import Image
+from lxml import html
 from pypdf import PdfReader
 import pytest
 from curl_cffi.requests.exceptions import HTTPError
@@ -18,7 +20,9 @@ def document_server():
     image_bytes = BytesIO()
     image.save(image_bytes, format="PNG")
     image.close()
-    state = {"challenge": False, "embed_status": 200, "fail_asset": False, "requests": []}
+    state = {"challenge": False, "embed_status": 200, "fail_asset": False, "requests": [],
+             "delay": 0, "active": 0, "peak": 0}
+    lock = Lock()
 
     def page(number):
         return f'''<div id="page{number}" style="width:40px;height:60px">
@@ -33,7 +37,18 @@ def document_server():
             pass
 
         def do_GET(self):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            try:
+                self.respond()
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+        def respond(self):
             state["requests"].append(self.path)
+            sleep(state["delay"])
             status = 200
             if self.path == "/embed":
                 body = pages.CLIENT_CHALLENGE if state["challenge"] else state["html"]
@@ -127,6 +142,76 @@ def test_http_error_without_challenge_does_not_launch_browser(
     assert not list(tmp_path.iterdir())
 
 
+def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch, tmp_path):
+    def page(number):
+        return f'''<div id="page{number}" style="width:40px;height:60px">
+            <img class="absimg" src="image{number}.png" style="width:40px;height:60px"></div>'''
+
+    root = html.fromstring(page(1))
+    metadata = [{"pageNum": 1}, {"pageNum": 2, "contentUrl": "/chunks/page2"},
+                {"pageNum": 3, "contentUrl": "/chunks/page3"}]
+    contents = BytesIO()
+    with Image.new("RGB", (40, 60), "red") as image:
+        image.save(contents, format="PNG")
+    requests = []
+    completed_chunks = []
+
+    async def run():
+        first_image = asyncio.Event()
+        third_chunk = asyncio.Event()
+
+        async def get(session, url, *, headers=None):
+            requests.append(url)
+            if url.endswith("/page2"):
+                # Would time out with the old fetch-all-chunks-first pipeline.
+                await asyncio.wait_for(first_image.wait(), 2)
+                await asyncio.wait_for(third_chunk.wait(), 2)
+                completed_chunks.append(2)
+                return ("page2_callback(" + json.dumps([page(2)]) + ");").encode()
+            if url.endswith("/page3"):
+                third_chunk.set()
+                completed_chunks.append(3)
+                return ("page3_callback(" + json.dumps([page(3)]) + ");").encode()
+            assert "image/webp" not in headers["Accept"]
+            first_image.set()
+            return contents.getvalue()
+
+        monkeypatch.setattr(pages, "_get", get)
+        return await pages._download_assets(
+            object(), root, metadata, 3, "https://example.com/embed", tmp_path, 2,
+        )
+
+    document, assets = asyncio.run(run())
+    assert [page.number for page in document] == [1, 2, 3]
+    assert completed_chunks == [3, 2]
+    assert set(assets) == {"https://example.com/image1.png", "https://example.com/chunks/image2.png",
+                           "https://example.com/chunks/image3.png"}
+    assert all(path.read_bytes() == contents.getvalue() for path in assets.values())
+
+
+def test_failed_worker_cancels_siblings_before_returning():
+    async def run():
+        running = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def slow():
+            running.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        async def fail():
+            await running.wait()
+            raise ValueError("original error")
+
+        with pytest.raises(ValueError, match="original error"):
+            await pages._gather_cancel(slow(), fail())
+        assert cancelled.is_set()
+
+    asyncio.run(run())
+
+
 def test_failed_assembly_preserves_output_and_removes_assets(monkeypatch, tmp_path, document_server):
     output = tmp_path / "existing.pdf"
     output.write_bytes(b"existing document")
@@ -139,6 +224,21 @@ def test_failed_assembly_preserves_output_and_removes_assets(monkeypatch, tmp_pa
         asyncio.run(pages.download_pdf(document_server["url"], output))
     assert output.read_bytes() == b"existing document"
     assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, 257, True, 1.5])
+def test_invalid_concurrency_rejected_before_network(concurrency):
+    with pytest.raises(ValueError, match="Concurrency"):
+        asyncio.run(pages.download_pdf("https://example.com/", concurrency=concurrency))
+
+
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_connection_limit_is_shared_by_chunks_and_images(tmp_path, document_server, concurrency):
+    document_server["delay"] = 0.05
+    asyncio.run(pages.download_pdf(
+        document_server["url"], tmp_path / "document.pdf", concurrency=concurrency,
+    ))
+    assert document_server["peak"] == concurrency
 
 
 def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path):

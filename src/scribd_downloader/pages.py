@@ -23,7 +23,7 @@ from .extractor import extract_embed_data
 
 
 logger = logging.getLogger(__name__)
-MAX_CONCURRENCY = 16
+MAX_CONCURRENCY = 32
 VIEWER_WIDTH = 1000
 JSONP = re.compile(r"\s*(?:window\.)?page(\d+)_callback\s*\((\[.*\])\)\s*;?\s*", re.S)
 CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
@@ -287,9 +287,26 @@ async def _get(session: AsyncSession, url: str, *, headers=None) -> bytes:
     return response.content
 
 
-async def _fetch_pages(session: AsyncSession, root, metadata, count: int, base_url: str) -> list[Page]:
+async def _gather_cancel(*coroutines):
+    """Propagate the original error and stop sibling requests before closing curl."""
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _fetch_pages(
+    session: AsyncSession, root, metadata, count: int, base_url: str,
+    *, concurrency: int = MAX_CONCURRENCY, on_page=None,
+) -> list[Page]:
     by_number = {}
     for entry in metadata:
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid page metadata")
         number = entry.get("pageNum")
         if isinstance(number, int) and not isinstance(number, bool):
             if number in by_number:
@@ -299,30 +316,40 @@ async def _fetch_pages(session: AsyncSession, root, metadata, count: int, base_u
     for node in root.xpath("//div[starts-with(@id,'page')]"):
         match = re.fullmatch(r"page(\d+)", node.get("id", ""))
         if match:
-            inline_pages[int(match.group(1))] = root
+            number = int(match.group(1))
+            if number in inline_pages:
+                raise ValueError(f"Duplicate inline data for page {number}")
+            inline_pages[number] = node
     missing = []
+    pages = [None] * count
+
+    def add_page(number, source, base):
+        page = parse_page(source, number, base)
+        pages[number - 1] = page
+        if on_page is not None:
+            on_page(page)
+
     for number in range(1, count + 1):
         entry = by_number.get(number, {})
         if entry.get("blur"):
             raise ValueError(f"Page {number} is blurred or unavailable")
-        if number not in inline_pages:
-            url = entry.get("contentUrl")
-            if not url:
-                raise ValueError(f"Page {number}: no inline data or page URL")
-            missing.append((number, url))
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+        chunk_url = entry.get("contentUrl")
+        base = _image_url(base_url, chunk_url) if chunk_url else base_url
+        if number in inline_pages:
+            add_page(number, inline_pages[number], base)
+        elif chunk_url:
+            missing.append((number, base))
+        else:
+            raise ValueError(f"Page {number}: no inline data or page URL")
+    # A fixed worker count avoids creating one asyncio task per document page.
+    pending = iter(missing)
 
-    async def get_chunk(number, url):
-        async with semaphore:
-            contents = await _get(session, url, headers={"Referer": base_url})
-        return number, _parse_jsonp(contents.decode("utf-8-sig"), number)
+    async def worker():
+        for number, chunk_url in pending:
+            contents = await _get(session, chunk_url, headers={"Referer": base_url})
+            add_page(number, _parse_jsonp(contents.decode("utf-8-sig"), number), chunk_url)
 
-    fetched = dict(await asyncio.gather(*(get_chunk(n, url) for n, url in missing)))
-    pages = []
-    for number in range(1, count + 1):
-        source = fetched[number] if number in fetched else inline_pages[number]
-        base = by_number.get(number, {}).get("contentUrl", base_url)
-        pages.append(parse_page(source, number, base))
+    await _gather_cancel(*(worker() for _ in range(min(concurrency, len(missing)))))
     return pages
 
 
@@ -334,6 +361,40 @@ def _validate_asset(contents: bytes, url: str) -> None:
                 raise ValueError("image exceeds 40 million pixels")
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise ValueError(f"Could not read image {url}: {exc}") from exc
+
+
+async def _download_assets(session, root, metadata, count, url, directory, concurrency):
+    assets = {}
+    pending = asyncio.Queue()
+    image_headers = {
+        "Referer": url,
+        # PDF can embed JPEG/PNG directly. Negotiating WebP/AVIF forces a
+        # decode and lossless transcode, often much larger than the source.
+        "Accept": "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
+    }
+
+    def enqueue(page):
+        for placement in page.placements:
+            if placement.url not in assets:
+                assets[placement.url] = directory / f"asset-{len(assets):06d}.image"
+                pending.put_nowait(placement.url)
+
+    async def producer():
+        pages = await _fetch_pages(
+            session, root, metadata, count, url, concurrency=concurrency, on_page=enqueue,
+        )
+        for _ in range(concurrency):
+            pending.put_nowait(None)
+        return pages
+
+    async def worker():
+        while (asset_url := await pending.get()) is not None:
+            contents = await _get(session, asset_url, headers=image_headers)
+            _validate_asset(contents, asset_url)
+            assets[asset_url].write_bytes(contents)
+
+    results = await _gather_cancel(producer(), *(worker() for _ in range(concurrency)))
+    return results[0], assets
 
 
 async def _ensure_chromium() -> None:
@@ -398,14 +459,19 @@ async def _pass_client_challenge(url: str, timeout: int) -> bytes:
         return contents
 
 
-async def download_pdf(url: str, output: Path | None = None, timeout: int = 30) -> int:
+async def download_pdf(
+    url: str, output: Path | None = None, timeout: int = 30,
+    *, concurrency: int = MAX_CONCURRENCY,
+) -> int:
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 256:
+        raise ValueError("Concurrency must be an integer between 1 and 256")
     started = perf_counter()
     request_headers = {
         "Referer": url,
         "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
     }
     async with AsyncSession(
-        impersonate="chrome", timeout=timeout, max_clients=MAX_CONCURRENCY, headers=request_headers,
+        impersonate="chrome", timeout=timeout, max_clients=concurrency, headers=request_headers,
     ) as session:
         embed_response = await session.get(url)
         embed_contents = embed_response.content
@@ -420,35 +486,24 @@ async def download_pdf(url: str, output: Path | None = None, timeout: int = 30) 
         except Exception as exc:
             raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc
         document_title = str(options["document"].get("title") or "")
-        if output is None:
-            output = _default_output_path(document_title)
+        output = Path(output) if output is not None else _default_output_path(document_title)
+        output.parent.mkdir(parents=True, exist_ok=True)
         count = options["document"]["page_count"]
-        pages = await _fetch_pages(session, root, metadata, count, url)
-        unique_urls = list(dict.fromkeys(item.url for page in pages for item in page.placements))
-        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        image_headers = {
-            "Referer": url,
-            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        }
-
-        async def get_asset(asset_url):
-            async with semaphore:
-                return asset_url, await _get(session, asset_url, headers=image_headers)
-
-        assets = dict(await asyncio.gather(*(get_asset(asset_url) for asset_url in unique_urls)))
-    logger.info("Fetched %d page assets for %d pages in %.2fs", len(assets), len(pages), perf_counter() - started)
-
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix="scribd-", dir=output.parent) as temporary:
-        directory = Path(temporary)
-        paths = {}
-        for number, (asset_url, contents) in enumerate(assets.items()):
-            _validate_asset(contents, asset_url)
-            path = directory / f"asset-{number:06d}.image"
-            path.write_bytes(contents)
-            paths[asset_url] = path
-        staged = _assemble_pdf(pages, paths, directory, document_title)
-        staged.replace(output)
-    logger.info("Assembled %d pages in %.2fs", count, perf_counter() - started)
+        with TemporaryDirectory(prefix="scribd-", dir=output.parent) as temporary:
+            directory = Path(temporary)
+            pages, assets = await _download_assets(
+                session, root, metadata, count, url, directory, concurrency,
+            )
+            fetched = perf_counter()
+            logger.info(
+                "Fetched %d unique images for %d pages in %.2fs",
+                len(assets), count, fetched - started,
+            )
+            staged = _assemble_pdf(pages, assets, directory, document_title)
+            size = staged.stat().st_size
+            staged.replace(output)
+    logger.info(
+        "Saved %s (%d pages, %.2f MiB); assembly %.2fs, total %.2fs",
+        output, count, size / 1024**2, perf_counter() - fetched, perf_counter() - started,
+    )
     return count
