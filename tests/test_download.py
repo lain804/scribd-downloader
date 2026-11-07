@@ -126,3 +126,10 @@ def test_http_error_without_challenge_does_not_launch_browser(
     with pytest.raises(HTTPError, match="404"):
         asyncio.run(pages.download_pdf(document_server["url"], tmp_path / "missing.pdf"))
     assert not list(tmp_path.iterdir())
+
+
+def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    output = pages._default_output_path("文" * 200)
+    assert len(output.name.encode("utf-8")) <= 255
+    output.touch()

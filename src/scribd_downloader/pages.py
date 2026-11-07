@@ -34,6 +34,8 @@ INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 def _default_output_path(title: str) -> Path:
     filename = INVALID_FILENAME_CHARACTERS.sub("_", str(title or "")).strip().rstrip(".")
+    # Common filesystems limit each filename to 255 bytes, including '.pdf'.
+    filename = filename.encode("utf-8", "replace")[:240].decode("utf-8", "ignore").rstrip(" .")
     if not filename or filename in {".", ".."}:
         filename = "document"
     return Path.cwd() / f"{filename}.pdf"
