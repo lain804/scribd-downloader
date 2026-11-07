@@ -34,7 +34,7 @@ def test_batch_reads_bom_skips_blanks_and_deduplicates_documents(monkeypatch, tm
                                         "https://www.scribd.com/embeds/456/content"]
     for _, kwargs in calls:
         assert kwargs == {"output_dir": Path(directory) if directory else tmp_path,
-                          "overwrite": False, "concurrency": 8}
+                          "overwrite": False, "concurrency": 8, "on_progress": None}
     output = capsys.readouterr().out
     assert "Saved 2 documents" in output
     assert "0 failed; 1 duplicates skipped" in output
@@ -122,4 +122,4 @@ def test_single_url_output_remains_supported(monkeypatch, arguments, expected_ou
     monkeypatch.setattr(sys, "argv", ["scribd-downloader", *arguments])
     cli.main()
     assert calls == [("https://www.scribd.com/embeds/123/content", expected_output,
-                      {"concurrency": 32, "output_dir": expected_dir})]
+                      {"concurrency": 32, "output_dir": expected_dir, "on_progress": None})]

@@ -36,6 +36,18 @@ time and final file size. Pages retain their source image resolution; JPEG and
 compatible PNG data are embedded directly without enlargement or lossy recompression.
 Shared image chunks are stored once in the PDF, with their original clipping.
 
+An interactive terminal shows a live page progress bar while downloading and
+assembling each PDF, for example:
+
+```text
+Downloading pages [########------------] 40/100 pages
+```
+
+A downloaded page is counted once its description and all its image chunks are
+ready. Batch downloads also show the current document number. Use `--no-progress`
+to hide the bar; it is automatically hidden when stderr is redirected. Redraws
+are limited to ten per second, with phase changes and completion shown immediately.
+
 ```sh
 scribd-downloader [scribd-url]
 ```

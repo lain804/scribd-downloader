@@ -216,7 +216,7 @@ def test_failed_assembly_preserves_output_and_removes_assets(monkeypatch, tmp_pa
     output = tmp_path / "existing.pdf"
     output.write_bytes(b"existing document")
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("assembly failed")
 
     monkeypatch.setattr(pages, "_assemble_pdf", fail)
@@ -270,3 +270,68 @@ def test_output_directory_preserves_existing_pdfs_and_handles_repeated_titles(tm
 def test_output_file_and_directory_are_mutually_exclusive(tmp_path):
     with pytest.raises(ValueError, match="either an output PDF path or an output directory"):
         asyncio.run(pages.download_pdf("https://example.com/", tmp_path / "file.pdf", output_dir=tmp_path))
+
+
+def test_download_progress_reports_ready_pages_assembly_and_success(tmp_path, document_server):
+    output = tmp_path / "document.pdf"
+    events = []
+
+    def progress(phase, completed, total):
+        events.append((phase, completed, total))
+        if phase == "Saved PDF":
+            assert output.is_file(), "Success must only be reported after replacing the output"
+
+    asyncio.run(pages.download_pdf(document_server["url"], output, on_progress=progress))
+    downloads = [done for phase, done, total in events if phase == "Downloading pages"]
+    assert downloads == sorted(set(downloads))
+    assert downloads[0] == 0 and downloads[-1] == 2
+    assert [done for phase, done, total in events if phase == "Assembling PDF"] == [0, 1, 2]
+    assert all(total == 2 for _, _, total in events)
+    assert events[-1] == ("Saved PDF", 2, 2)
+
+
+def test_progress_waits_for_all_assets_and_handles_shared_cached_and_text_pages(monkeypatch, tmp_path):
+    root = html.fromstring('''<main>
+        <div id="page1" style="width:40px;height:60px">
+          <img class="absimg" src="/a.png" style="width:40px;height:60px">
+          <img class="absimg" src="/a.png" style="width:40px;height:60px">
+          <img class="absimg" src="/b.png" style="width:40px;height:60px">
+        </div>
+        <div id="page3" style="width:40px;height:60px">
+          <div class="text_layer" style="font-size:20px">
+            <span style="left:0;top:0">Text only</span>
+          </div>
+        </div></main>''')
+    metadata = [{"pageNum": 1}, {"pageNum": 2, "contentUrl": "/page2"}, {"pageNum": 3}]
+    events = []
+    buffer = BytesIO()
+    with Image.new("RGB", (40, 60), "red") as image:
+        image.save(buffer, format="PNG")
+
+    async def run():
+        image_a = asyncio.Event()
+        cached_page_ready = asyncio.Event()
+
+        def progress(phase, done, total):
+            events.append((phase, done, total))
+            if done == 2:
+                cached_page_ready.set()
+
+        async def get(session, url, *, headers=None):
+            if url.endswith("/page2"):
+                await asyncio.wait_for(image_a.wait(), 2)
+                page = '''<div id="page2" style="width:40px;height:60px">
+                    <img class="absimg" src="/a.png" style="width:40px;height:60px"></div>'''
+                return ("page2_callback(" + json.dumps([page]) + ");").encode()
+            if url.endswith("/a.png"):
+                image_a.set()
+            else:
+                await asyncio.wait_for(cached_page_ready.wait(), 2)
+            return buffer.getvalue()
+
+        monkeypatch.setattr(pages, "_get", get)
+        await pages._download_assets(object(), root, metadata, 3, "https://example.com/embed",
+                                     tmp_path, 2, on_progress=progress)
+
+    asyncio.run(run())
+    assert events == [("Downloading pages", number, 3) for number in range(4)]

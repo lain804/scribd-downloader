@@ -1,5 +1,6 @@
 """Download Scribd page chunks and place their original images in a PDF."""
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 import json
@@ -28,6 +29,7 @@ VIEWER_WIDTH = 1000
 JSONP = re.compile(r"\s*(?:window\.)?page(\d+)_callback\s*\((\[.*\])\)\s*;?\s*", re.S)
 CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
 INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+ProgressCallback = Callable[[str, int, int], None]
 
 
 def _default_output_path(title: str, directory: Path | None = None) -> Path:
@@ -186,11 +188,11 @@ def parse_page(root, number: int, base_url: str) -> Page:
     return Page(number, width, height, tuple(placements), tuple(text_runs))
 
 
-def _text_pdf(pages: list[Page]) -> BytesIO:
+def _text_pdf(pages: list[Page], *, on_progress: ProgressCallback | None = None) -> BytesIO:
     """Create small PDF pages containing the visible and searchable HTML text."""
     contents = BytesIO()
     overlay = Canvas(contents, pageCompression=1)
-    for page in pages:
+    for number, page in enumerate(pages, 1):
         width = VIEWER_WIDTH * 72 / 96
         height = page.height * width / page.width
         overlay.setPageSize((width, height))
@@ -214,12 +216,17 @@ def _text_pdf(pages: list[Page]) -> BytesIO:
             obj.textOut(text)
         overlay.drawText(obj)
         overlay.showPage()
+        if on_progress is not None:
+            on_progress("Assembling PDF", number, len(pages))
     overlay.save()
     contents.seek(0)
     return contents
 
 
-def _assemble_pdf(pages: list[Page], assets: dict[str, Path], directory: Path, title: str) -> Path:
+def _assemble_pdf(
+    pages: list[Page], assets: dict[str, Path], directory: Path, title: str,
+    *, on_progress: ProgressCallback | None = None,
+) -> Path:
     """Embed each asset once, then reconstruct CSS clipping using PDF commands.
 
     img2pdf preserves JPEG/PNG compression, bit depth, color profiles and alpha.
@@ -227,9 +234,11 @@ def _assemble_pdf(pages: list[Page], assets: dict[str, Path], directory: Path, t
     the encoded streams and shared image objects while replacing their pages.
     """
     urls = list(assets)
+    if on_progress is not None:
+        on_progress("Assembling PDF", 0, len(pages))
     staged = directory / "document.pdf"
     if not urls:
-        with pikepdf.Pdf.open(_text_pdf(pages)) as document:
+        with pikepdf.Pdf.open(_text_pdf(pages, on_progress=on_progress)) as document:
             document.docinfo["/Title"] = title
             document.save(staged, object_stream_mode=pikepdf.ObjectStreamMode.generate)
         return staged
@@ -245,7 +254,7 @@ def _assemble_pdf(pages: list[Page], assets: dict[str, Path], directory: Path, t
             url: asset_page.Resources.XObject.Im0
             for url, asset_page in zip(urls, document.pages, strict=True)
         }
-        for page, text_page in zip(pages, text.pages, strict=True):
+        for number, (page, text_page) in enumerate(zip(pages, text.pages, strict=True), 1):
             document.pages.append(text_page)
             pdf_page = document.pages[-1]
             resources = pikepdf.Dictionary()
@@ -275,6 +284,8 @@ def _assemble_pdf(pages: list[Page], assets: dict[str, Path], directory: Path, t
             commands.append("Q")
             pdf_page.Resources.XObject = resources
             pdf_page.contents_add(pikepdf.Stream(document, "\n".join(commands).encode("ascii")), prepend=True)
+            if on_progress is not None:
+                on_progress("Assembling PDF", number, len(pages))
         del document.pages[:len(urls)]
         document.save(staged, object_stream_mode=pikepdf.ObjectStreamMode.generate)
     return staged
@@ -372,9 +383,18 @@ def _validate_asset(contents: bytes, url: str) -> None:
         raise ValueError(f"Could not read image {url}: {exc}") from exc
 
 
-async def _download_assets(session, root, metadata, count, url, directory, concurrency):
+async def _download_assets(
+    session, root, metadata, count, url, directory, concurrency,
+    *, on_progress: ProgressCallback | None = None,
+):
     assets = {}
     pending = asyncio.Queue()
+    downloaded = set()
+    waiting = {}
+    remaining = {}
+    completed = 0
+    if on_progress is not None:
+        on_progress("Downloading pages", 0, count)
     image_headers = {
         "Referer": url,
         # PDF can embed JPEG/PNG directly. Negotiating WebP/AVIF forces a
@@ -383,10 +403,20 @@ async def _download_assets(session, root, metadata, count, url, directory, concu
     }
 
     def enqueue(page):
+        nonlocal completed
         for placement in page.placements:
             if placement.url not in assets:
                 assets[placement.url] = directory / f"asset-{len(assets):06d}.image"
                 pending.put_nowait(placement.url)
+        if on_progress is not None:
+            needed = {placement.url for placement in page.placements} - downloaded
+            if not needed:
+                completed += 1
+                on_progress("Downloading pages", completed, count)
+            else:
+                remaining[page.number] = len(needed)
+                for asset_url in needed:
+                    waiting.setdefault(asset_url, []).append(page.number)
 
     async def producer():
         pages = await _fetch_pages(
@@ -397,10 +427,21 @@ async def _download_assets(session, root, metadata, count, url, directory, concu
         return pages
 
     async def worker():
+        nonlocal completed
         while (asset_url := await pending.get()) is not None:
             contents = await _get(session, asset_url, headers=image_headers)
             _validate_asset(contents, asset_url)
             assets[asset_url].write_bytes(contents)
+            if on_progress is not None:
+                downloaded.add(asset_url)
+                before = completed
+                for number in waiting.pop(asset_url, ()):
+                    remaining[number] -= 1
+                    if remaining[number] == 0:
+                        del remaining[number]
+                        completed += 1
+                if completed != before:
+                    on_progress("Downloading pages", completed, count)
 
     results = await _gather_cancel(producer(), *(worker() for _ in range(concurrency)))
     return results[0], assets
@@ -472,6 +513,7 @@ async def download_pdf(
     url: str, output: Path | None = None, timeout: int = 30,
     *, concurrency: int = MAX_CONCURRENCY,
     output_dir: Path | None = None, overwrite: bool = True,
+    on_progress: ProgressCallback | None = None,
 ) -> int:
     if output is not None and output_dir is not None:
         raise ValueError("Choose either an output PDF path or an output directory")
@@ -505,17 +547,20 @@ async def download_pdf(
             directory = Path(temporary)
             pages, assets = await _download_assets(
                 session, root, metadata, count, url, directory, concurrency,
+                on_progress=on_progress,
             )
             fetched = perf_counter()
             logger.info(
                 "Fetched %d unique images for %d pages in %.2fs",
                 len(assets), count, fetched - started,
             )
-            staged = _assemble_pdf(pages, assets, directory, document_title)
+            staged = _assemble_pdf(pages, assets, directory, document_title, on_progress=on_progress)
             size = staged.stat().st_size
             if not overwrite:
                 output = _available_output_path(output)
             staged.replace(output)
+            if on_progress is not None:
+                on_progress("Saved PDF", count, count)
     logger.info(
         "Saved %s (%d pages, %.2f MiB); assembly %.2fs, total %.2fs",
         output, count, size / 1024**2, perf_counter() - fetched, perf_counter() - started,

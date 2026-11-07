@@ -6,6 +6,7 @@ import re
 from scribd_downloader.cli import build_parser
 from scribd_downloader.constants import DOCUMENT_ID_SEARCH_PATTERN
 from scribd_downloader.pages import download_pdf
+from scribd_downloader.progress import ProgressBar, ProgressLoggingHandler
 
 
 def extract_document_id(url: str):
@@ -34,15 +35,17 @@ def _read_batch(path: Path):
     return documents, invalid, duplicates
 
 
-async def _download_batch(documents, output_dir: Path, concurrency: int):
+async def _download_batch(documents, output_dir: Path, concurrency: int, show_progress: bool = True):
     saved = 0
     failed = 0
-    for url, document_id in documents:
+    for number, (url, document_id) in enumerate(documents, 1):
         try:
-            count = await download_pdf(
-                f"https://www.scribd.com/embeds/{document_id}/content",
-                output_dir=output_dir, overwrite=False, concurrency=concurrency,
-            )
+            with ProgressBar(f"Document {number}/{len(documents)}", enabled=show_progress) as on_progress:
+                count = await download_pdf(
+                    f"https://www.scribd.com/embeds/{document_id}/content",
+                    output_dir=output_dir, overwrite=False, concurrency=concurrency,
+                    on_progress=on_progress,
+                )
         except Exception as exc:
             logging.error("Download failed for %s: %s", url, exc)
             failed += 1
@@ -56,6 +59,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     logging.basicConfig(
+        handlers=[ProgressLoggingHandler()],
         level=logging.INFO if args.verbose else logging.WARNING,
         format="[%(asctime)s] [%(levelname)-8s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -76,7 +80,9 @@ def main():
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             parser.error(f"Could not create output directory {output_dir}: {exc}")
-        saved, failed = asyncio.run(_download_batch(documents, output_dir, args.concurrency))
+        saved, failed = asyncio.run(_download_batch(
+            documents, output_dir, args.concurrency, show_progress=not args.no_progress,
+        ))
         failed += invalid
         print(f"Saved {saved} documents to {output_dir}; {failed} failed; {duplicates} duplicates skipped")
         if failed:
@@ -86,10 +92,12 @@ def main():
     if document_id is None:
         parser.error("Expected a Scribd /document/<id> or /doc/<id> URL")
     try:
-        count = asyncio.run(download_pdf(
-            f"https://www.scribd.com/embeds/{document_id}/content", args.output,
-            concurrency=args.concurrency, output_dir=args.output_dir,
-        ))
+        with ProgressBar(enabled=not args.no_progress) as on_progress:
+            count = asyncio.run(download_pdf(
+                f"https://www.scribd.com/embeds/{document_id}/content", args.output,
+                concurrency=args.concurrency, output_dir=args.output_dir,
+                on_progress=on_progress,
+            ))
     except Exception as exc:
         logging.error("Download failed: %s", exc)
         raise SystemExit(1) from exc
