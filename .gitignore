@@ -1,10 +1,20 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-.pytest_cache
-# Virtual environments
-.venv
+# Ignore everything except project files.
+*
+!/.gitignore
+!/.python-version
+!/README.md
+!/pyproject.toml
+!/uv.lock
+
+!/src/
+!/src/**/
+!/src/**/*.py
+
+!/tests/
+!/tests/**/
+!/tests/**/*.py
+
+!/benchmarks/
+!/benchmarks/**/
+!/benchmarks/**/*.py
+!/benchmarks/**/*.md
