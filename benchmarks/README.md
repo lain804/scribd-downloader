@@ -63,18 +63,18 @@ available bandwidth, and browser challenges can dominate total download time.
 
 Live embed inspection found that text layers can contain visible content, and
 some pages have only HTML text. The old parser rejected those pages. They are now
-supported; visible text is retained, while explicitly transparent or zero-opacity
-text remains invisible and searchable. A span's own font size is recognized,
+supported; visible text is retained, while transparent, zero-opacity and marked
+scan OCR text is omitted. A span's own font size is recognized,
 alpha transparency is preserved,
 clipping is intersected correctly with image/page boundaries, and oversized image
 headers are rejected before allocating pixel buffers. Long generated filenames
 are limited by UTF-8 byte length to fit ordinary filesystem filename limits.
 
 Regression checks cover byte-for-byte JPEG preservation, shared PDF image
-objects, lossless PNG modes, searchability, visual clipping/transparency through
+objects, lossless PNG modes, omission of hidden text, visual clipping/transparency through
 Poppler, and preservation of an existing output on download/assembly failure.
 HTML text still has the existing Helvetica/Windows-1252, custom font mapping and
-fixed text-transform limitations described in the main README.
+fixed text-transform limitations.
 
 Live sample: the [MIT license embed](https://www.scribd.com/embeds/595393746/content)
 contains visible text without image segments. This was used to check text-only

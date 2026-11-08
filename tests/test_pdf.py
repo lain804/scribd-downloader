@@ -52,15 +52,16 @@ def test_png_modes_remain_lossless(tmp_path, mode):
         assert actual.convert("RGBA").tobytes() == original.convert("RGBA").tobytes()
 
 
-def test_text_is_searchable_but_invisible(tmp_path):
+def test_hidden_text_is_not_embedded(tmp_path):
     with Image.new("RGB", (100, 100), "white") as image:
         asset(tmp_path, image)
     placement = pages.Placement("asset", 0, 0, 100, 100, (0, 100, 100, 0))
     text = ((0, 0, 50, None, "Search this text"),)
     output = assemble(tmp_path, [placement], text=text)
     page = PdfReader(output).pages[0]
-    assert "Search this text" in page.extract_text()
-    assert b"3 Tr" in page.get_contents().get_data()
+    assert page.extract_text() == ""
+    assert b"Search this text" not in page.get_contents().get_data()
+    assert b"3 Tr" not in page.get_contents().get_data()
     if shutil.which("pdftoppm"):
         subprocess.run(["pdftoppm", "-scale-to", "100", "-singlefile", "-png", str(output),
                         str(tmp_path / "text")], check=True, capture_output=True)
@@ -122,11 +123,60 @@ def test_span_own_font_size_is_used():
 
 
 @pytest.mark.parametrize("css", ["color:transparent", "opacity:0"])
-def test_transparent_text_visibility_is_inherited(css):
+def test_transparent_text_is_omitted(css):
     root = html.fromstring(f'''<div id="page1" style="width:100px;height:100px">
+        <img class="absimg" src="scan.png" style="width:100px;height:100px">
         <div class="text_layer" style="font-size:20px;{css}">
-            <span style="left:2px;top:3px">Hidden but searchable</span></div></div>''')
-    assert pages.parse_page(root, 1, "https://example.com/").text_runs[0][3] is None
+            <span style="left:2px;top:3px">Hidden text</span></div></div>''')
+    assert pages.parse_page(root, 1, "https://example.com/").text_runs == ()
+
+
+@pytest.mark.parametrize("opacity", ["0.50", ".5", "0.500"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_scan_ocr_is_omitted_but_native_text_stays_visible(tmp_path, opacity, inherited):
+    # Scribd's scanned pages contain both half-opacity OCR and native text
+    # missing from the scan, such as the judge's name in document 450403112.
+    marker = f"opacity:{opacity};filter:alpha(opacity=50)"
+    root = html.fromstring(f'''<div id="page1" style="width:100px;height:100px">
+        <img class="absimg" src="scan.png" style="width:100px;height:100px">
+        <div class="text_layer" style="font-size:50px">
+            <div style="{marker if inherited else ''}">
+                <span style="left:10px;top:20px;{'' if inherited else marker}">Scanned words</span>
+            </div>
+            <span style="left:10px;top:200px">Kenneth J. Mansfield</span>
+        </div></div>''')
+    page = pages.parse_page(root, 1, "https://example.com/")
+    assert len(page.text_runs) == 1
+    assert page.text_runs[0][3:] == ((0, 0, 0), "Kenneth J. Mansfield")
+    with Image.new("RGB", (100, 100), "white") as image:
+        source = asset(tmp_path, image)
+    output = pages._assemble_pdf([page], {page.placements[0].url: source}, tmp_path, "Scan")
+    pdf_page = PdfReader(output).pages[0]
+    assert "Scanned words" not in pdf_page.extract_text()
+    assert "Kenneth J. Mansfield" in pdf_page.extract_text()
+    # Only the native text is emitted, using the default visible render mode.
+    modes = []
+    mode = 0
+    for operands, operator in pdf_page.get_contents().operations:
+        if operator == b"Tr":
+            mode = int(operands[0])
+        elif operator == b"Tj":
+            modes.append((str(operands[0]), mode))
+    assert modes == [("Kenneth J. Mansfield", 0)]
+
+
+@pytest.mark.parametrize(("image", "css"), [
+    (False, "opacity:0.50;filter:alpha(opacity=50)"),
+    (True, "opacity:0.50"),
+    (True, "opacity:1;filter:alpha(opacity=50)"),
+])
+def test_only_marked_image_backed_ocr_is_hidden(image, css):
+    root = html.fromstring(f'''<div id="page1" style="width:100px;height:100px">
+        {'<img class="absimg" src="scan.png" style="width:100px;height:100px">' if image else ''}
+        <div class="text_layer" style="font-size:20px">
+            <span style="left:2px;top:3px;{css}">Visible content</span>
+        </div></div>''')
+    assert pages.parse_page(root, 1, "https://example.com/").text_runs[0][3] == (0, 0, 0)
 
 
 def test_text_only_pages_keep_visible_content_and_title(tmp_path):

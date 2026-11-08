@@ -119,6 +119,16 @@ def _image_url(base: str, value: str) -> str:
     return url
 
 
+def _scan_ocr(style: dict[str, str]) -> bool:
+    """Recognize Scribd's half-opacity OCR markup over scanned page images."""
+    if style.get("filter") != "alpha(opacity=50)":
+        return False
+    try:
+        return float(style.get("opacity", "1")) == 0.5
+    except ValueError:
+        return False
+
+
 def parse_page(root, number: int, base_url: str) -> Page:
     nodes = root.xpath(f"descendant-or-self::div[@id='page{number}']")
     if len(nodes) != 1:
@@ -130,10 +140,11 @@ def parse_page(root, number: int, base_url: str) -> Page:
         raise ValueError(f"Page {number}: invalid or oversized canvas {width} x {height}")
     if css.get("transform", "none") != "none":
         raise ValueError(f"Page {number}: transformed page canvases are unsupported")
-    # Pages can combine visible HTML text, image segments and transparent text
-    # overlays. Retain text visibility rather than assuming images contain it.
+    # Pages can combine visible HTML text and image segments. Ignore hidden
+    # overlays rather than adding a searchable copy of the image content.
     if page.xpath(".//canvas | .//svg"):
         raise ValueError(f"Page {number}: canvas/SVG page content is unsupported")
+    images = page.xpath(".//img[contains(concat(' ',normalize-space(@class),' '),' absimg ')]")
     text_runs = []
     for layer in page.xpath(
         ".//*[contains(concat(' ',normalize-space(@class),' '),' text_layer ')]"
@@ -150,14 +161,18 @@ def parse_page(root, number: int, base_url: str) -> Page:
             if font_size <= 0:
                 continue
             color = _text_color(next((css["color"] for css in inherited if css.get("color")), None))
-            if any(css.get("opacity") in {"0", "0.0", "0.00"} for css in inherited):
-                color = None
+            if color is None or any(css.get("opacity") in {"0", "0.0", "0.00"} for css in inherited):
+                continue
+            # OCR duplicates text already present in the scan. Omit it while
+            # retaining ordinary visible HTML additions to the source page.
+            if images and any(_scan_ocr(css) for css in inherited):
+                continue
             text_runs.append((
                 _pixels(style["left"]), _pixels(style["top"]), font_size,
                 color, text,
             ))
     placements = []
-    for img in page.xpath(".//img[contains(concat(' ',normalize-space(@class),' '),' absimg ')]"):
+    for img in images:
         style = _style(img)
         left, top = _pixels(style.get("left", "0")), _pixels(style.get("top", "0"))
         image_width, image_height = _pixels(style["width"]), _pixels(style["height"])
@@ -189,7 +204,7 @@ def parse_page(root, number: int, base_url: str) -> Page:
 
 
 def _text_pdf(pages: list[Page], *, on_progress: ProgressCallback | None = None) -> BytesIO:
-    """Create small PDF pages containing the visible and searchable HTML text."""
+    """Create small PDF pages containing only the source's visible HTML text."""
     contents = BytesIO()
     overlay = Canvas(contents, pageCompression=1)
     for number, page in enumerate(pages, 1):
@@ -201,17 +216,17 @@ def _text_pdf(pages: list[Page], *, on_progress: ProgressCallback | None = None)
         previous_size = None
         previous_color = object()
         for left, top, font_size, color, text in page.text_runs:
+            if color is None:
+                continue
             # Helvetica uses WinAnsi; replace unsupported glyphs while keeping
-            # the rest of the page's searchable text.
+            # the rest of the page's visible text.
             text = text.encode("cp1252", "replace").decode("cp1252")
             obj.setTextOrigin(left * scale, height - (top + font_size) * scale)
             if font_size != previous_size:
                 obj.setFont("Helvetica", font_size * scale)
                 previous_size = font_size
             if color != previous_color:
-                obj.setTextRenderMode(3 if color is None else 0)
-                if color is not None:
-                    obj.setFillColorRGB(*color)
+                obj.setFillColorRGB(*color)
                 previous_color = color
             obj.textOut(text)
         overlay.drawText(obj)

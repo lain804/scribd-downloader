@@ -28,7 +28,9 @@ def document_server():
         return f'''<div id="page{number}" style="width:40px;height:60px">
           <img class="absimg" orig="/image.png" style="width:40px;height:60px">
           <div class="text_layer" style="font-size:20px;color:black">
-            <span style="left:10px;top:10px">Page {number} searchable text</span>
+            <span style="left:10px;top:10px">Page {number} visible text</span>
+            <span style="left:10px;top:20px;color:transparent">Hidden text</span>
+            <span style="left:10px;top:30px;opacity:0.50;filter:alpha(opacity=50)">OCR text</span>
           </div>
         </div>'''
 
@@ -108,7 +110,9 @@ def test_download_assembles_all_pages_without_replaying_challenge(
     assert count == len(reader.pages) == 2
     assert reader.metadata.title == "Test Manual"
     for number, pdf_page in enumerate(reader.pages, 1):
-        assert f"Page {number} searchable text" in pdf_page.extract_text()
+        assert f"Page {number} visible text" in pdf_page.extract_text()
+        assert "Hidden text" not in pdf_page.extract_text()
+        assert "OCR text" not in pdf_page.extract_text()
         assert len(pdf_page.images) == 1
         assert pdf_page.images[0].image.getpixel((0, 0)) == (255, 0, 0)
     assert calls == ([state["url"]] if challenge else [])

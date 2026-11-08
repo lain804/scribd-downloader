@@ -50,7 +50,7 @@ def fixture(directory, format, count):
             pages.Placement(url, 0, 0, 1200, 1600, (top, 1200, top + 200, 0))
             for top in range(0, 1600, 200)
         )
-        text = ((400, 300, 100, (0, 0, 0), f"Page {number} searchable text"),)
+        text = ((400, 300, 100, (0, 0, 0), f"Page {number} visible text"),)
         document.append(pages.Page(number, 1200, 1600, placements, text))
     return document, assets
 
