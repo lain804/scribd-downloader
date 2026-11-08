@@ -6,10 +6,11 @@ from io import BytesIO
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import sys
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from time import perf_counter
 from urllib.parse import urljoin, urlsplit
 
@@ -240,7 +241,7 @@ def _text_pdf(pages: list[Page], *, on_progress: ProgressCallback | None = None)
 
 def _assemble_pdf(
     pages: list[Page], assets: dict[str, Path], directory: Path, title: str,
-    *, on_progress: ProgressCallback | None = None,
+    *, on_progress: ProgressCallback | None = None, destination: Path | None = None,
 ) -> Path:
     """Embed each asset once, then reconstruct CSS clipping using PDF commands.
 
@@ -251,7 +252,7 @@ def _assemble_pdf(
     urls = list(assets)
     if on_progress is not None:
         on_progress("Assembling PDF", 0, len(pages))
-    staged = directory / "document.pdf"
+    staged = destination if destination is not None else directory / "document.pdf"
     if not urls:
         with pikepdf.Pdf.open(_text_pdf(pages, on_progress=on_progress)) as document:
             document.docinfo["/Title"] = title
@@ -548,7 +549,10 @@ async def download_pdf(
         output = Path(output) if output is not None else _default_output_path(document_title, output_dir)
         output.parent.mkdir(parents=True, exist_ok=True)
         count = options["document"]["page_count"]
-        with TemporaryDirectory(prefix="scribd-", dir=output.parent) as temporary:
+        temporary_parent = output.parent
+        if sys.platform == "win32":
+            temporary_parent = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"
+        with TemporaryDirectory(prefix="scribd-", dir=temporary_parent) as temporary:
             directory = Path(temporary)
             pages, assets = await _download_assets(
                 session, root, metadata, count, url, directory, concurrency,
@@ -559,11 +563,23 @@ async def download_pdf(
                 "Fetched %d unique images for %d pages in %.2fs",
                 len(assets), count, fetched - started,
             )
-            staged = _assemble_pdf(pages, assets, directory, document_title, on_progress=on_progress)
-            size = staged.stat().st_size
-            if not overwrite:
-                output = _available_output_path(output)
-            staged.replace(output)
+            staged = directory / "document.pdf"
+            if sys.platform == "win32":
+                # Python's private temp directory has an owner-only Windows
+                # ACL that survives moving files out. Stage the final PDF next
+                # to its destination so it inherits normal folder permissions.
+                with NamedTemporaryFile(prefix="scribd-", suffix=".pdf", dir=output.parent,
+                                        delete=False) as stream:
+                    staged = Path(stream.name)
+            try:
+                _assemble_pdf(pages, assets, directory, document_title,
+                              on_progress=on_progress, destination=staged)
+                size = staged.stat().st_size
+                if not overwrite:
+                    output = _available_output_path(output)
+                staged.replace(output)
+            finally:
+                staged.unlink(missing_ok=True)
             if on_progress is not None:
                 on_progress("Saved PDF", count, count)
     logger.info(

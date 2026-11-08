@@ -2,6 +2,9 @@ import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
+import os
+import subprocess
+import sys
 from threading import Lock, Thread
 from time import sleep
 
@@ -228,6 +231,29 @@ def test_failed_assembly_preserves_output_and_removes_assets(monkeypatch, tmp_pa
         asyncio.run(pages.download_pdf(document_server["url"], output))
     assert output.read_bytes() == b"existing document"
     assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL inheritance")
+def test_download_inherits_destination_permissions(tmp_path, document_server):
+    # Make the destination distinguishable from Python 3.13's private temp
+    # directories, which replace inherited permissions with an owner-only ACL.
+    identity = subprocess.check_output(["whoami"], text=True).strip()
+    subprocess.run(["icacls", str(tmp_path), "/grant", f"{identity}:(OI)(CI)(RX)"],
+                   check=True, capture_output=True)
+    baseline = tmp_path / "normal-file"
+    baseline.write_bytes(b"normal destination permissions")
+    output = tmp_path / "document.pdf"
+    asyncio.run(pages.download_pdf(document_server["url"], output))
+    script = '''@{
+        actual = (Get-Acl -LiteralPath $env:SCRIBD_TEST_OUTPUT).Sddl
+        expected = (Get-Acl -LiteralPath $env:SCRIBD_TEST_BASELINE).Sddl
+    } | ConvertTo-Json -Compress'''
+    acls = json.loads(subprocess.check_output(
+        ["powershell", "-NoProfile", "-Command", script], text=True,
+        env={**os.environ, "SCRIBD_TEST_OUTPUT": str(output), "SCRIBD_TEST_BASELINE": str(baseline)},
+    ))
+    assert acls["actual"] == acls["expected"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["document.pdf", "normal-file"]
 
 
 @pytest.mark.parametrize("concurrency", [0, -1, 257, True, 1.5])
