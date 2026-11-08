@@ -66,7 +66,8 @@ def browser(monkeypatch):
         status=200,
         navigation=True,
         closed=False,
-        waited=False,
+        navigation_options=None,
+        navigation_error=False,
     )
 
     async def ensure():
@@ -81,9 +82,20 @@ def browser(monkeypatch):
             self.handler = handler
 
         async def wait_for_function(self, expression, **kwargs):
-            state.waited = True
-            if pages.CLIENT_CHALLENGE in state.contents:
-                raise TimeoutError("Challenge never cleared")
+            pytest.fail("Scribd's Content Security Policy blocks eval-based waits")
+
+        async def goto(self, url, **kwargs):
+            state.navigation_options = kwargs
+            if state.navigation_error:
+                raise async_api.TimeoutError("Navigation timed out")
+            # Full page load may never finish despite receiving valid HTML.
+            assert kwargs["wait_until"] == "commit"
+            if state.navigation:
+                self.handler(Response(self.main_frame, True, pages.CLIENT_CHALLENGE))
+                self.handler(Response(self.main_frame, True))
+            # Ignore both iframe navigations and non-navigation responses.
+            self.handler(Response(object(), True))
+            self.handler(Response(self.main_frame, False))
 
     class Response:
         def __init__(self, frame, navigation, contents=None):
@@ -98,29 +110,16 @@ def browser(monkeypatch):
 
     class Browser:
         def __init__(self, **kwargs):
-            pass
+            self.context = self
+
+        async def new_page(self):
+            return Page()
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, *args):
             state.closed = True
-
-        async def fetch(self, url, *, page_setup, page_action, **kwargs):
-            page = Page()
-            await page_setup(page)
-            if state.navigation:
-                page.handler(Response(page.main_frame, True, pages.CLIENT_CHALLENGE))
-                page.handler(Response(page.main_frame, True))
-            # Ignore both iframe navigations and non-navigation responses.
-            page.handler(Response(object(), True))
-            page.handler(Response(page.main_frame, False))
-            try:
-                await page_action(page)
-            except TimeoutError:
-                # Scrapling logs callback failures and returns a response anyway.
-                pass
-            return SimpleNamespace(body=b"<html>mutated browser DOM</html>")
 
     monkeypatch.setattr(fetchers, "AsyncStealthySession", Browser)
     return state
@@ -129,7 +128,7 @@ def browser(monkeypatch):
 def test_challenge_returns_original_navigation_html(browser):
     result = asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 5))
     assert result == browser.contents
-    assert browser.waited
+    assert browser.navigation_options == {"wait_until": "commit", "timeout": 5000}
     assert browser.closed
 
 
@@ -138,11 +137,18 @@ def test_challenge_returns_original_navigation_html(browser):
     [
         (pages.CLIENT_CHALLENGE, 200, True, "did not complete successfully"),
         (b"Not found", 404, True, "HTTP 404"),
-        (b"", 200, False, "no document response"),
+        (b"", 200, False, "did not complete successfully"),
     ],
 )
 def test_browser_failures_are_reported(browser, contents, status, navigation, message):
     browser.contents, browser.status, browser.navigation = contents, status, navigation
     with pytest.raises(RuntimeError, match=message):
-        asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 5))
+        asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 0.01))
+    assert browser.closed
+
+
+def test_navigation_timeout_closes_browser(browser):
+    browser.navigation_error = True
+    with pytest.raises(RuntimeError, match="did not complete successfully"):
+        asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 0.01))
     assert browser.closed

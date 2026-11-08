@@ -484,44 +484,34 @@ async def _ensure_chromium() -> None:
 
 
 async def _pass_client_challenge(url: str, timeout: int) -> bytes:
+    from patchright.async_api import TimeoutError as BrowserTimeoutError
     from scrapling.fetchers import AsyncStealthySession
 
     await _ensure_chromium()
-    responses = []
+    async with AsyncStealthySession(headless=True, timeout=timeout * 1000) as browser:
+        page = await browser.context.new_page()
+        responses = asyncio.Queue()
 
-    async def capture_navigation(page):
         def capture(response):
             if response.request.is_navigation_request() and response.frame == page.main_frame:
-                responses.append(response)
+                responses.put_nowait(response)
 
         page.on("response", capture)
-
-    async def wait_for_challenge(page):
-        await page.wait_for_function(
-            "document.title !== 'Client Challenge'",
-            timeout=timeout * 1000,
-        )
-
-    async with AsyncStealthySession(
-        headless=True, disable_resources=True, network_idle=False,
-        timeout=timeout * 1000, max_pages=1, retries=1,
-    ) as browser:
-        await browser.fetch(
-            url, page_setup=capture_navigation, page_action=wait_for_challenge,
-            google_search=False,
-        )
-        if not responses:
-            raise RuntimeError("Scribd's browser challenge returned no document response")
-        response = responses[-1]
-        # Use the original HTML: browser rendering mutates page dimensions and
-        # transforms. Replaying clearance cookies through curl can be challenged
-        # again because its browser fingerprint differs.
-        contents = await response.body()
-        if CLIENT_CHALLENGE in contents:
-            raise RuntimeError("Scribd's browser challenge did not complete successfully")
-        if response.status >= 400:
-            raise RuntimeError(f"Scribd returned HTTP {response.status} after the browser challenge")
-        return contents
+        try:
+            async with asyncio.timeout(timeout):
+                # Loading the full page can stall on unrelated resources. The
+                # challenge also forbids the eval used by wait_for_function.
+                # Watch original navigation bodies instead of the rendered DOM.
+                await page.goto(url, wait_until="commit", timeout=timeout * 1000)
+                while True:
+                    response = await responses.get()
+                    contents = await response.body()
+                    if response.status >= 400:
+                        raise RuntimeError(f"Scribd returned HTTP {response.status} after the browser challenge")
+                    if CLIENT_CHALLENGE not in contents:
+                        return contents
+        except (TimeoutError, BrowserTimeoutError) as exc:
+            raise RuntimeError("Scribd's browser challenge did not complete successfully before the timeout") from exc
 
 
 async def download_pdf(
