@@ -1,7 +1,7 @@
 [project]
 name = "scribd-downloader"
 version = "0.1.0"
-description = "Download and assemble Scribd document image chunks without a browser"
+description = "Download Scribd documents preserving page images, fonts and text layout"
 readme = "README.md"
 authors = [
     { name = "lain", email = "lain" }

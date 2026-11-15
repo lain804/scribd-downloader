@@ -13,7 +13,7 @@ def _concurrency(value: str) -> int:
 
 
 def build_parser() -> ArgumentParser:
-    parser = ArgumentParser(description="Download Scribd page image chunks and assemble them into a PDF")
+    parser = ArgumentParser(description="Download Scribd documents preserving page images, fonts and layout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log download and assembly progress")
     parser.add_argument("--no-progress", action="store_true", help="Hide the terminal page progress bar")
     parser.add_argument("-j", "--concurrency", type=_concurrency, default=32,
