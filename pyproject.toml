@@ -19,7 +19,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=9.1.1", "pypdf>=6.0.0"]
+dev = [
+    "pytest>=9.1.1",
+    "pypdf>=6.0.0",
+    "pypdfium2>=5.15.2",
+]
 
 [project.scripts]
 scribd-downloader = "scribd_downloader.__main__:main"

@@ -14,7 +14,16 @@ var Scribd = {
     EmbedsShow: function(selector, options) {embedOptions = options;},
     jsblock: {resolve: function() {}}, hook_tooltips: function() {}
 };
-var docManager = {addPage: function(page) {pages.push(page);}, allPagesAdded: function() {}};
+var fonts = [];
+var docManager = {
+    addPage: function(page) {pages.push(page);}, allPagesAdded: function() {},
+    addFont: function(id, shortstyle, family, fallback, weight, style) {
+        fonts.push({id:id, family:family, weight:weight, style:style});
+    },
+    setEmbeddedDoc: function() {}, initStyles: function() {},
+    setPageWidths: function() {}, setImageDomainSubstitution: function() {}
+};
+function DocumentManager() {return docManager;}
 function $() {return {addClass: function() {}};}
 function trackEvent() {}
 function XMLHttpRequest() {}
@@ -28,7 +37,7 @@ def extract_embed_data(root):
     embed_script = next((s for s in scripts if re.search(r"new\s+Scribd\.EmbedsShow\s*\(", s)), None)
     page_scripts = [
         s for s in scripts
-        if re.search(r"\bdocManager\.addPage\s*\(", s)
+        if re.search(r"\bdocManager\.(?:addPage|addFont)\s*\(", s)
         and not s.lstrip().startswith("var DocumentManager=")
     ]
     if embed_script is None or not page_scripts:
@@ -42,7 +51,9 @@ def extract_embed_data(root):
         for script in page_scripts:
             if script != embed_script:
                 context.eval(script)
-        data = json.loads(context.eval("JSON.stringify({embed:embedOptions,pages:pages})"))
+        data = json.loads(context.eval("""JSON.stringify({embed:embedOptions,pages:pages,
+            fonts:fonts, fontHosts:docManager.fontAggregatorHosts,
+            assetPrefix:docManager.assetPrefix})"""))
     except quickjs.JSException as exc:
         raise ValueError(f"Could not decode document metadata: {exc}") from exc
     options, pages = data["embed"], data["pages"]
@@ -50,4 +61,7 @@ def extract_embed_data(root):
     count = document.get("page_count")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1 or not pages:
         raise ValueError("Document metadata has no valid page count or page descriptions")
+    if data["fonts"]:
+        options["font_data"] = {"fonts": data["fonts"], "hosts": data.get("fontHosts"),
+                                "asset_prefix": data.get("assetPrefix")}
     return options, pages

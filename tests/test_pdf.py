@@ -155,14 +155,11 @@ def test_scan_ocr_is_omitted_but_native_text_stays_visible(tmp_path, opacity, in
     assert "Scanned words" not in pdf_page.extract_text()
     assert "Kenneth J. Mansfield" in pdf_page.extract_text()
     # Only the native text is emitted, using the default visible render mode.
-    modes = []
-    mode = 0
-    for operands, operator in pdf_page.get_contents().operations:
-        if operator == b"Tr":
-            mode = int(operands[0])
-        elif operator == b"Tj":
-            modes.append((str(operands[0]), mode))
-    assert modes == [("Kenneth J. Mansfield", 0)]
+    # Text may live in a Form XObject when CSS transforms are present.
+    operations = []
+    pdf_page.extract_text(visitor_operand_before=lambda op, args, *_: operations.append((op, args)))
+    assert any(op in {b"Tj", b"TJ"} for op, _ in operations)
+    assert all(op != b"Tr" or int(args[0]) != 3 for op, args in operations)
 
 
 @pytest.mark.parametrize(("image", "css"), [

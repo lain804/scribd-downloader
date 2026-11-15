@@ -1,6 +1,7 @@
 """Download Scribd page chunks and place their original images in a PDF."""
 import asyncio
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
 import json
@@ -68,6 +69,7 @@ class Page:
     height: float
     placements: tuple[Placement, ...]
     text_runs: tuple[tuple[float, float, float, tuple[float, float, float] | None, str], ...]
+    text_html: str = ""
 
 
 def _style(node) -> dict[str, str]:
@@ -147,14 +149,15 @@ def parse_page(root, number: int, base_url: str) -> Page:
         raise ValueError(f"Page {number}: canvas/SVG page content is unsupported")
     images = page.xpath(".//img[contains(concat(' ',normalize-space(@class),' '),' absimg ')]")
     text_runs = []
-    for layer in page.xpath(
+    layers = page.xpath(
         ".//*[contains(concat(' ',normalize-space(@class),' '),' text_layer ')]"
-    ):
+    )
+    for layer in layers:
         for span in layer.xpath(".//span[@style]"):
             style = _style(span)
             if "left" not in style or "top" not in style:
                 continue
-            text = "".join(span.itertext()).replace("\ufffd", "")
+            text = "".join(span.itertext())
             if not text.strip():
                 continue
             inherited = [style, *(_style(node) for node in span.iterancestors())]
@@ -201,11 +204,43 @@ def parse_page(root, number: int, base_url: str) -> Page:
         placements.append(Placement(_image_url(base_url, value), left, top, image_width, image_height, clip))
     if not placements and not text_runs:
         raise ValueError(f"Page {number}: no image segments or supported text were found")
-    return Page(number, width, height, tuple(placements), tuple(text_runs))
+    # Retain the inline spacer spans, kerning, font classes and Unicode exactly.
+    # itertext() is useful for detecting visible content, not for rendering it.
+    text_layers = []
+    for layer in layers:
+        layer = deepcopy(layer)
+        def hidden(node):
+            style = _style(node)
+            return (style.get("color") == "transparent"
+                    or style.get("opacity") in {"0", "0.0", "0.00"}
+                    or bool(images and _scan_ocr(style)))
+
+        if hidden(layer):
+            continue
+        for node in list(layer.iter()):
+            if node.getparent() is None:
+                continue
+            style = _style(node)
+            if node.tag == "span" and "left" in style and "top" in style:
+                classes = node.get("class", "").split()
+                if not {"a", "g"}.intersection(classes):
+                    node.set("class", " ".join([*classes, "a"]))
+            if node.tag in {"script", "iframe", "object", "embed", "link", "img"}:
+                node.drop_tree()
+            elif hidden(node):
+                node.drop_tree()
+        text_layers.append(html.tostring(layer, encoding="unicode", with_tail=False))
+    return Page(number, width, height, tuple(placements), tuple(text_runs), "".join(text_layers))
 
 
-def _text_pdf(pages: list[Page], *, on_progress: ProgressCallback | None = None) -> BytesIO:
+def _text_pdf(
+    pages: list[Page], *, on_progress: ProgressCallback | None = None, text_style: str = "",
+) -> BytesIO:
     """Create small PDF pages containing only the source's visible HTML text."""
+    if any(page.text_html and page.text_runs for page in pages):
+        from .text import render_text_pdf
+
+        return render_text_pdf(pages, VIEWER_WIDTH, text_style, on_progress=on_progress)
     contents = BytesIO()
     overlay = Canvas(contents, pageCompression=1)
     for number, page in enumerate(pages, 1):
@@ -242,6 +277,7 @@ def _text_pdf(pages: list[Page], *, on_progress: ProgressCallback | None = None)
 def _assemble_pdf(
     pages: list[Page], assets: dict[str, Path], directory: Path, title: str,
     *, on_progress: ProgressCallback | None = None, destination: Path | None = None,
+    text_style: str = "",
 ) -> Path:
     """Embed each asset once, then reconstruct CSS clipping using PDF commands.
 
@@ -254,7 +290,7 @@ def _assemble_pdf(
         on_progress("Assembling PDF", 0, len(pages))
     staged = destination if destination is not None else directory / "document.pdf"
     if not urls:
-        with pikepdf.Pdf.open(_text_pdf(pages, on_progress=on_progress)) as document:
+        with pikepdf.Pdf.open(_text_pdf(pages, on_progress=on_progress, text_style=text_style)) as document:
             document.docinfo["/Title"] = title
             document.save(staged, object_stream_mode=pikepdf.ObjectStreamMode.generate)
         return staged
@@ -265,7 +301,7 @@ def _assemble_pdf(
             engine=img2pdf.Engine.internal, rotation=img2pdf.Rotation.none,
             first_frame_only=True, title=title,
         )
-    with pikepdf.Pdf.open(native) as document, pikepdf.Pdf.open(_text_pdf(pages)) as text:
+    with pikepdf.Pdf.open(native) as document, pikepdf.Pdf.open(_text_pdf(pages, text_style=text_style)) as text:
         images = {
             url: asset_page.Resources.XObject.Im0
             for url, asset_page in zip(urls, document.pages, strict=True)
@@ -273,7 +309,9 @@ def _assemble_pdf(
         for number, (page, text_page) in enumerate(zip(pages, text.pages, strict=True), 1):
             document.pages.append(text_page)
             pdf_page = document.pages[-1]
-            resources = pikepdf.Dictionary()
+            # Chromium can put text in Form XObjects (e.g. transformed layers).
+            # Preserve these when adding the original image assets.
+            resources = pikepdf.Dictionary(pdf_page.Resources.get("/XObject", {}))
             names = {}
             scale = VIEWER_WIDTH * 72 / 96 / page.width
             commands = [f"q {scale:.9f} 0 0 {scale:.9f} 0 0 cm"]
@@ -287,7 +325,10 @@ def _assemble_pdf(
                 if right <= left or bottom <= top:
                     continue
                 if placement.url not in names:
-                    names[placement.url] = f"/Im{len(names)}"
+                    index = len(names)
+                    while f"/Im{index}" in resources:
+                        index += 1
+                    names[placement.url] = f"/Im{index}"
                     resources[names[placement.url]] = images[placement.url]
                 name = names[placement.url]
                 commands.append(
@@ -471,7 +512,7 @@ async def _ensure_chromium() -> None:
     async with async_playwright() as playwright:
         if Path(playwright.chromium.executable_path).is_file():
             return
-    logger.warning("Installing Chromium for Scribd's browser challenge; this may take a few minutes")
+    logger.warning("Installing Chromium for Scribd text rendering and browser challenges; this may take a few minutes")
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "patchright", "install", "chromium",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -558,6 +599,13 @@ async def download_pdf(
                 session, root, metadata, count, url, directory, concurrency,
                 on_progress=on_progress,
             )
+            text_style = ""
+            if any(page.text_html and page.text_runs for page in pages):
+                from .text import download_text_style
+
+                text_style = await download_text_style(session, root, options.get("font_data"),
+                                                       url, concurrency)
+                await _ensure_chromium()
             fetched = perf_counter()
             logger.info(
                 "Fetched %d unique images for %d pages in %.2fs",
@@ -572,8 +620,10 @@ async def download_pdf(
                                         delete=False) as stream:
                     staged = Path(stream.name)
             try:
-                _assemble_pdf(pages, assets, directory, document_title,
-                              on_progress=on_progress, destination=staged)
+                await asyncio.to_thread(
+                    _assemble_pdf, pages, assets, directory, document_title,
+                    on_progress=on_progress, destination=staged, text_style=text_style,
+                )
                 size = staged.stat().st_size
                 if not overwrite:
                     output = _available_output_path(output)
