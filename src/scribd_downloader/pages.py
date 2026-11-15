@@ -541,7 +541,7 @@ async def download_pdf(
         else:
             embed_response.raise_for_status()
         try:
-            root = html.fromstring(embed_contents)
+            root = html.fromstring(embed_contents.decode("utf-8-sig"))
             options, metadata = extract_embed_data(root)
         except Exception as exc:
             raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc

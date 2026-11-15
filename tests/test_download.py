@@ -135,6 +135,15 @@ def test_failed_download_preserves_existing_output(tmp_path, document_server):
     assert list(tmp_path.iterdir()) == [output]
 
 
+def test_utf8_inline_page_text_survives_download(tmp_path, document_server):
+    document_server["html"] = document_server["html"].replace(
+        b"Page 1 visible text", "café —".encode("utf-8"),
+    )
+    output = tmp_path / "unicode.pdf"
+    asyncio.run(pages.download_pdf(document_server["url"], output))
+    assert "café —" in PdfReader(output).pages[0].extract_text()
+
+
 def test_http_error_without_challenge_does_not_launch_browser(
     monkeypatch, tmp_path, document_server
 ):
