@@ -10,6 +10,13 @@ class ProgressBar:
     def __init__(self, label: str = "", *, enabled: bool = True, stream=None):
         self.stream = stream if stream is not None else sys.stderr
         self.enabled = enabled and self.stream.isatty()
+        self._fill = "█"
+        encoding = getattr(self.stream, "encoding", None)
+        if self.enabled and encoding:
+            try:
+                self._fill.encode(encoding)
+            except UnicodeEncodeError:
+                self._fill = "#"
         self.label = f"{label}: " if label else ""
         self.phase = ""
         self.completed = self.total = 0
@@ -43,7 +50,7 @@ class ProgressBar:
             return
         if total:
             filled = min(20, completed * 20 // total)
-            bar = "#" * filled + "-" * (20 - filled)
+            bar = self._fill * filled + "-" * (20 - filled)
             self._line = f"{self.label}{phase} [{bar}] {completed}/{total} pages"
         else:
             self._line = f"{self.label}{phase}..."

@@ -30,8 +30,8 @@ def test_bar_throttles_redraws_but_keeps_phase_changes_and_final_counts(monkeypa
     output = stream.getvalue()
     assert "0/10 pages" in output
     assert "1/10 pages" not in output
-    assert "9/10 pages" in output
-    assert "Saved PDF [####################] 10/10 pages" in output
+    assert "Downloading pages [██████████████████--] 9/10 pages" in output
+    assert "Saved PDF [████████████████████] 10/10 pages" in output
     assert output.endswith("\n")
 
 
@@ -42,13 +42,23 @@ def test_non_terminal_and_disabled_progress_have_no_output(stream, enabled):
     assert stream.getvalue() == ""
 
 
+def test_progress_uses_ascii_fill_on_legacy_terminals():
+    class LegacyTerminal(Terminal):
+        encoding = "cp1252"
+
+    stream = LegacyTerminal()
+    with progress.ProgressBar(stream=stream) as update:
+        update("Downloading pages", 1, 2)
+    assert b"Downloading pages [##########----------] 1/2 pages" in stream.getvalue().encode(stream.encoding)
+
+
 def test_failed_download_finishes_line_with_latest_page_count():
     stream = Terminal()
     with pytest.raises(RuntimeError, match="Download failed"):
         with progress.ProgressBar(stream=stream) as update:
             update("Downloading pages", 3, 10)
             raise RuntimeError("Download failed")
-    assert "Failed [######--------------] 3/10 pages" in stream.getvalue()
+    assert "Failed [██████--------------] 3/10 pages" in stream.getvalue()
     assert stream.getvalue().endswith("\n")
     assert progress.ProgressBar.active is None
 
@@ -95,4 +105,4 @@ def test_batch_bar_shows_document_index_and_can_be_disabled(monkeypatch, tmp_pat
     else:
         assert "Document 1/2: Saved PDF" in stream.getvalue()
         assert "Document 2/2: Saved PDF" in stream.getvalue()
-        assert stream.getvalue().count("Saved PDF [####################] 3/3 pages") == 2
+        assert stream.getvalue().count("Saved PDF [████████████████████] 3/3 pages") == 2
