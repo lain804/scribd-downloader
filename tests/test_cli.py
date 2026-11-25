@@ -14,7 +14,7 @@ def test_batch_reads_bom_skips_blanks_and_deduplicates_documents(monkeypatch, tm
     source.write_text(
         "\ufeff  https://www.scribd.com/document/123/First  \n\n"
         "https://www.scribd.com/doc/456/Second\n"
-        "https://www.scribd.com/doc/123/Another-title?share=1\n",
+        "HTTPS://WWW.SCRIBD.COM/doc/00123/Another-title?share=1\n",
         encoding="utf-8",
     )
     calls = []
@@ -61,6 +61,11 @@ def test_batch_continues_after_invalid_links_and_failed_downloads(monkeypatch, t
     assert f"{source}:2:" in caplog.text
     assert "Server unavailable" in caplog.text
     assert "Saved 2 documents" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("url", ["https://www.scribd.com/doc/١٢٣", "https://www.scribd.com/doc/123/title\x1b"])
+def test_document_url_rejects_non_ascii_ids_and_terminal_controls(url):
+    assert cli.extract_document_id(url) is None
 
 
 @pytest.mark.parametrize("contents", [None, b"\n \n", b"\xff"])

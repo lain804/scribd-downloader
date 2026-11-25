@@ -10,8 +10,10 @@ from scribd_downloader.progress import ProgressBar, ProgressLoggingHandler
 
 
 def extract_document_id(url: str):
+    if not url.isprintable():
+        return None
     match = re.fullmatch(DOCUMENT_ID_SEARCH_PATTERN, url)
-    return match.group(1) if match else None
+    return (match.group(1).lstrip("0") or "0") if match else None
 
 
 def _read_batch(path: Path):
@@ -19,19 +21,20 @@ def _read_batch(path: Path):
     seen = set()
     invalid = 0
     duplicates = 0
-    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        url = line.strip()
-        if not url:
-            continue
-        document_id = extract_document_id(url)
-        if document_id is None:
-            logging.error("%s:%d: Invalid Scribd document URL: %s", path, number, url)
-            invalid += 1
-        elif document_id in seen:
-            duplicates += 1
-        else:
-            seen.add(document_id)
-            documents.append((url, document_id))
+    with path.open(encoding="utf-8-sig") as links:
+        for number, line in enumerate(links, 1):
+            url = line.strip()
+            if not url:
+                continue
+            document_id = extract_document_id(url)
+            if document_id is None:
+                logging.error("%s:%d: Invalid Scribd document URL: %r", path, number, url)
+                invalid += 1
+            elif document_id in seen:
+                duplicates += 1
+            else:
+                seen.add(document_id)
+                documents.append((url, document_id))
     return documents, invalid, duplicates
 
 
