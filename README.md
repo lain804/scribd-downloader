@@ -18,6 +18,7 @@ pip install git+https://github.com/lain804/scribd-downloader.git
 
 ```sh
 scribd-downloader <scribd-url>
+scribd-downloader --file links.txt --output-dir downloads
 scribd-downloader --help
 ```
 
@@ -28,4 +29,6 @@ on first use). Scanned OCR overlays are omitted to avoid duplicating the scan.
 The downloader accepts up to 10,000 pages per document. The HTTP client allows
 the original embed origin and HTTPS URLs on Scribd's domains. It caps decoded
 responses at 32 MiB for the embed, 16 MiB for a page chunk or font, and 64 MiB
-for an image.
+for an image. Title-based filenames receive a numeric suffix on collisions.
+On POSIX, title-based output paths need a filesystem that supports hard links.
+An explicit output path replaces the file at that path.

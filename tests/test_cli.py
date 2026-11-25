@@ -122,4 +122,5 @@ def test_single_url_output_remains_supported(monkeypatch, arguments, expected_ou
     monkeypatch.setattr(sys, "argv", ["scribd-downloader", *arguments])
     cli.main()
     assert calls == [("https://www.scribd.com/embeds/123/content", expected_output,
-                      {"concurrency": 32, "output_dir": expected_dir, "on_progress": None})]
+                      {"concurrency": 32, "output_dir": expected_dir,
+                       "overwrite": expected_output is not None, "on_progress": None})]

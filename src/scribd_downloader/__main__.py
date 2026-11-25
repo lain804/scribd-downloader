@@ -95,7 +95,7 @@ def main():
         with ProgressBar(enabled=not args.no_progress) as on_progress:
             count = asyncio.run(download_pdf(
                 f"https://www.scribd.com/embeds/{document_id}/content", args.output,
-                concurrency=args.concurrency, output_dir=args.output_dir,
+                concurrency=args.concurrency, output_dir=args.output_dir, overwrite=args.output is not None,
                 on_progress=on_progress,
             ))
     except Exception as exc:

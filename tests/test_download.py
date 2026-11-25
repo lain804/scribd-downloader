@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -6,7 +7,7 @@ import json
 import os
 import subprocess
 import sys
-from threading import Lock, Thread
+from threading import Barrier, Event, Lock, Thread
 from time import sleep
 from types import SimpleNamespace
 
@@ -315,6 +316,61 @@ def test_failed_assembly_preserves_output_and_removes_assets(monkeypatch, tmp_pa
     assert list(tmp_path.iterdir()) == [output]
 
 
+def test_cancelled_assembly_waits_before_cleaning_up(monkeypatch, tmp_path, document_server):
+    output = tmp_path / "existing.pdf"
+    output.write_bytes(b"previous output")
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        finish = Event()
+        assembled = Event()
+
+        def assemble(document, assets, directory, title, *, destination, **kwargs):
+            loop.call_soon_threadsafe(started.set)
+            assert finish.wait(timeout=5)
+            assert directory.is_dir()
+            destination.write_bytes(b"cancelled output")
+            assembled.set()
+
+        monkeypatch.setattr(pages, "_assemble_pdf", assemble)
+        download = asyncio.create_task(pages.download_pdf(document_server["url"], output))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=10)
+            download.cancel()
+            await asyncio.sleep(0)
+            download.cancel()
+            await asyncio.sleep(0)
+            assert not download.done()
+        finally:
+            finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await download
+        assert assembled.is_set()
+
+    asyncio.run(run())
+    assert output.read_bytes() == b"previous output"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_concurrent_publication_assigns_distinct_files(tmp_path):
+    original = tmp_path / "document.pdf"
+    original.write_bytes(b"previous output")
+    ready = Barrier(2)
+
+    def publish(number):
+        staged = tmp_path / f"stage-{number}"
+        staged.write_bytes(str(number).encode())
+        ready.wait(timeout=5)
+        return pages._publish_new_pdf(staged, original)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outputs = list(pool.map(publish, (1, 2)))
+    assert {path.name for path in outputs} == {"document (1).pdf", "document (2).pdf"}
+    assert [path.read_bytes() for path in outputs] == [b"1", b"2"]
+    assert original.read_bytes() == b"previous output"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL inheritance")
 def test_download_inherits_destination_permissions(tmp_path, document_server):
     # Make the destination distinguishable from Python 3.13's private temp
@@ -358,6 +414,10 @@ def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path
     output = pages._default_output_path("文" * 200)
     assert len(output.name.encode("utf-8")) <= 255
     output.touch()
+
+
+def test_reserved_filename_gets_a_usable_prefix(tmp_path):
+    assert pages._default_output_path("NUL", tmp_path) == tmp_path / "_NUL.pdf"
 
 
 def test_output_directory_preserves_existing_pdfs_and_handles_repeated_titles(tmp_path, document_server):

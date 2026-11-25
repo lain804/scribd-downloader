@@ -7,6 +7,7 @@ from io import BytesIO
 import json
 import logging
 import math
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -34,7 +35,7 @@ CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
 MAX_EMBED_BYTES = 32 * 1024 * 1024
 MAX_ASSET_BYTES = 64 * 1024 * 1024
 RASTER_FORMATS = ("AVIF", "BMP", "GIF", "ICO", "JPEG", "JPEG2000", "PNG", "TIFF", "WEBP")
-INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 ProgressCallback = Callable[[str, int, int], None]
 
 
@@ -44,16 +45,26 @@ def _default_output_path(title: str, directory: Path | None = None) -> Path:
     filename = filename.encode("utf-8", "replace")[:240].decode("utf-8", "ignore").rstrip(" .")
     if not filename or filename in {".", ".."}:
         filename = "document"
+    if ntpath.isreserved(filename):
+        filename = f"_{filename}"
     return (Path(directory) if directory is not None else Path.cwd()) / f"{filename}.pdf"
 
 
-def _available_output_path(output: Path) -> Path:
+def _publish_new_pdf(staged: Path, output: Path) -> Path:
+    # POSIX rename replaces existing files. A hard link fails if the name is taken.
     candidate = output
     number = 1
-    while candidate.exists():
+    while True:
+        try:
+            if sys.platform == "win32":
+                staged.rename(candidate)
+            else:
+                os.link(staged, candidate)
+            return candidate
+        except FileExistsError:
+            pass
         candidate = output.with_name(f"{output.stem} ({number}){output.suffix}")
         number += 1
-    return candidate
 
 
 @dataclass(frozen=True)
@@ -645,9 +656,7 @@ async def download_pdf(
         output = Path(output) if output is not None else _default_output_path(document_title, output_dir)
         output.parent.mkdir(parents=True, exist_ok=True)
         count = options["document"]["page_count"]
-        temporary_parent = output.parent
-        if sys.platform == "win32":
-            temporary_parent = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"
+        temporary_parent = None if sys.platform == "win32" else output.parent
         with TemporaryDirectory(prefix="scribd-", dir=temporary_parent) as temporary:
             directory = Path(temporary)
             pages, assets = await _download_assets(
@@ -675,14 +684,26 @@ async def download_pdf(
                                         delete=False) as stream:
                     staged = Path(stream.name)
             try:
-                await asyncio.to_thread(
+                assembly = asyncio.create_task(asyncio.to_thread(
                     _assemble_pdf, pages, assets, directory, document_title,
                     on_progress=on_progress, destination=staged, text_style=text_style,
-                )
+                ))
+                try:
+                    await asyncio.shield(assembly)
+                except asyncio.CancelledError:
+                    # The assembly thread still owns the input and staging files.
+                    while not assembly.done():
+                        try:
+                            await asyncio.shield(assembly)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not assembly.cancelled():
+                        assembly.exception()
+                    raise
                 size = staged.stat().st_size
-                if not overwrite:
-                    output = _available_output_path(output)
-                staged.replace(output)
+                output = staged.replace(output) if overwrite else _publish_new_pdf(staged, output)
             finally:
                 staged.unlink(missing_ok=True)
             if on_progress is not None:
