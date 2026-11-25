@@ -39,6 +39,11 @@ lossless transcode remains expensive. No additional lossy compression is applied
 Output size depends on source encoding and how much of each source image is used;
 direct embedding retains the entire source asset even when only part is visible.
 
+In a separate 120-page fixture with a shared JPEG and native text on every
+twelfth page, median assembly over three runs fell from 2.03 s at `053589b` to
+0.98 s. The renderer printed 10 pages through Chromium and generated the other
+110 page overlays directly.
+
 ## Download behavior
 
 - Images are queued as soon as inline or fetched page data is parsed, overlapping
@@ -73,8 +78,10 @@ are limited by UTF-8 byte length to fit ordinary filesystem filename limits.
 Regression checks cover byte-for-byte JPEG preservation, shared PDF image
 objects, lossless PNG modes, omission of hidden text, visual clipping/transparency through
 Poppler, and preservation of an existing output on download/assembly failure.
-HTML text still has the existing Helvetica/Windows-1252, custom font mapping and
-fixed text-transform limitations.
+Native text uses Chromium to preserve embedded fonts, Unicode, spacers and
+kerning. On mixed documents, only pages with visible text are printed by
+Chromium. The ReportLab fallback uses Helvetica and Windows-1252 for
+programmatically constructed pages.
 
 Live sample: the [MIT license embed](https://www.scribd.com/embeds/595393746/content)
 contains visible text without image segments. This was used to check text-only

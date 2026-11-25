@@ -76,6 +76,18 @@ def test_bad_font_does_not_silently_render_with_a_substitute(css):
         render_text_pdf([page], 200, css)
 
 
+def test_mixed_pages_keep_order_sizes_and_plain_text_links():
+    text_page = pages.parse_page(html.fromstring('''<div id="page2" style="width:200px;height:300px">
+        <div class="text_layer" style="font-size:50px">
+            <span style="left:10px;top:10px"><a href="https://example.com/">Reference</a></span>
+        </div></div>'''), 2, "https://example.com/")
+    document = [pages.Page(1, 200, 100, (), ()), text_page, pages.Page(3, 200, 400, (), ())]
+    pdf = PdfReader(render_text_pdf(document, 200, ""))
+    assert [float(page.mediabox.height) for page in pdf.pages] == pytest.approx([75, 225, 300], abs=1)
+    assert [page.extract_text().strip() for page in pdf.pages] == ["", "Reference", ""]
+    assert "/Annots" not in pdf.pages[1]
+
+
 def test_native_font_spacers_kerning_unicode_and_page_boundaries(tmp_path):
     pdfium = pytest.importorskip("pypdfium2")
     font = (Path(reportlab.__file__).parent / "fonts" / "Vera.ttf").read_bytes()

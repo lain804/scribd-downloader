@@ -175,7 +175,8 @@ def parse_page(root, number: int, base_url: str) -> Page:
     page = nodes[0]
     css = _style(page)
     width, height = _pixels(css["width"]), _pixels(css["height"])
-    if min(width, height) <= 0 or width * height > 40_000_000:
+    if (min(width, height) <= 0 or width * height > 40_000_000
+            or not 3 <= height / width * (VIEWER_WIDTH * 72 / 96) <= 14_400):
         raise ValueError(f"Page {number}: invalid or oversized canvas {width} x {height}")
     if css.get("transform", "none") != "none":
         raise ValueError(f"Page {number}: transformed page canvases are unsupported")
@@ -243,7 +244,7 @@ def parse_page(root, number: int, base_url: str) -> Page:
     # Retain the inline spacer spans, kerning, font classes and Unicode exactly.
     # itertext() is useful for detecting visible content, not for rendering it.
     text_layers = []
-    for layer in layers:
+    for layer in layers if text_runs else ():
         layer = deepcopy(layer)
         def hidden(node):
             style = _style(node)

@@ -83,7 +83,7 @@ section:last-child { break-after:auto }
                              f'font-size:{size}px;color:rgb({rgb})">{escape(value)}</span>')
             content = '<div class="text_layer">' + "".join(spans) + '</div>'
         sections.append(
-            f'<section style="page:p{index};width:{width:.9f}px;height:{height:.9f}px">'
+            f'<section style="display:none;page:p{index};width:{width:.9f}px;height:{height:.9f}px">'
             f'<div class="newpage" style="width:{page.width}px;height:{page.height}px;'
             f'transform:scale({viewer_width / page.width:.12f});transform-origin:top left">'
             f'{content}</div></section>'
@@ -100,6 +100,7 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
     import pikepdf
 
     contents = BytesIO()
+    print_pages = [page for page in pages if page.text_runs]
     with pikepdf.Pdf.new() as result, sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, chromium_sandbox=True)
         try:
@@ -107,7 +108,7 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
             tab = context.new_page()
             # All assets are embedded. Never fetch resources from document HTML.
             tab.route("**/*", lambda route: route.abort())
-            tab.set_content(text_document(pages, viewer_width, text_style), wait_until="load")
+            tab.set_content(text_document(print_pages, viewer_width, text_style), wait_until="load")
             tab.emulate_media(media="screen")
             # Loading failure is fatal: falling back changes glyph widths and
             # can also expose codepoints meant only for a custom subset font.
@@ -127,19 +128,26 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
             # descendants before applying scale(.2) in a multi-page flow, which
             # otherwise drops lines or adds blank pages. Keep the loaded fonts
             # and browser alive while switching the single visible section.
-            for index, source in enumerate(pages):
-                tab.evaluate("index => document.querySelectorAll('section').forEach((s,i) => "
-                             "s.style.display = i === index ? 'block' : 'none')", index)
-                data = tab.pdf(prefer_css_page_size=True, print_background=True)
-                with pikepdf.Pdf.open(BytesIO(data)) as rendered:
-                    if len(rendered.pages) != 1:
-                        raise ValueError(f"Page {source.number}: text renderer produced extra pages")
-                    page = rendered.pages[0]
-                    if "/Annots" in page.obj:
-                        del page.obj["/Annots"]
-                    result.pages.append(page)
+            printed = 0
+            for index, source in enumerate(pages, 1):
+                if source.text_runs:
+                    tab.evaluate("index => { const page = document.body.children[index]; "
+                                 "if (page.previousElementSibling) page.previousElementSibling.style.display = 'none'; "
+                                 "page.style.display = 'block'; }", printed)
+                    printed += 1
+                    data = tab.pdf(prefer_css_page_size=True, print_background=True)
+                    with pikepdf.Pdf.open(BytesIO(data)) as rendered:
+                        if len(rendered.pages) != 1:
+                            raise ValueError(f"Page {source.number}: text renderer did not produce one page")
+                        page = rendered.pages[0]
+                        if "/Annots" in page.obj:
+                            del page.obj["/Annots"]
+                        result.pages.append(page)
+                else:
+                    width = viewer_width * 72 / 96
+                    result.add_blank_page(page_size=(width, source.height * width / source.width))
                 if on_progress is not None:
-                    on_progress("Assembling PDF", index + 1, len(pages))
+                    on_progress("Assembling PDF", index, len(pages))
             result.save(contents)
         finally:
             browser.close()
