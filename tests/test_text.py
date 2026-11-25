@@ -30,6 +30,16 @@ def test_font_metadata_is_extracted_with_original_weight_and_style():
     }
 
 
+@pytest.mark.parametrize("document", ["null", "{page_count:true}", "{page_count:10001}"])
+def test_invalid_document_metadata_is_rejected(document):
+    root = html.fromstring(f'''<script>
+        new Scribd.EmbedsShow("#embed", {{document:{document}}});
+        docManager.addPage({{pageNum:1}});
+    </script>''')
+    with pytest.raises(ValueError, match="page count"):
+        extract_embed_data(root)
+
+
 def test_original_font_asset_is_embedded_and_failure_propagates(monkeypatch):
     root = html.fromstring('<style>.text_layer .w { display:inline-block }</style>')
     font_data = {"hosts": ["https://html.scribdassets.com"], "asset_prefix": "assets",

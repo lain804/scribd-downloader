@@ -24,3 +24,5 @@ scribd-downloader --help
 Page images are embedded losslessly. Documents with native text retain Scribd's
 embedded fonts, spacing and layout using headless Chromium (installed automatically
 on first use). Scanned OCR overlays are omitted to avoid duplicating the scan.
+
+The downloader accepts up to 10,000 pages per document.

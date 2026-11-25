@@ -1,10 +1,12 @@
 """Extract Scribd page metadata from its inline HTML/JavaScript."""
 import json
 import re
+from time import perf_counter
 
 import quickjs
 
 
+MAX_PAGES = 10_000
 _STUBS = r"""
 var embedOptions = null;
 var pages = [];
@@ -44,24 +46,37 @@ def extract_embed_data(root):
         raise ValueError("Could not find Scribd document/page metadata; the embed may be unavailable")
     context = quickjs.Context()
     context.set_memory_limit(32 * 1024 * 1024)
-    context.set_time_limit(5)
+    deadline = perf_counter() + 5
+
+    def evaluate(script):
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            raise ValueError("Scribd metadata exceeded its execution time limit")
+        context.set_time_limit(remaining)
+        return context.eval(script)
+
     try:
-        context.eval(_STUBS)
-        context.eval(embed_script)
+        evaluate(_STUBS)
+        evaluate(embed_script)
         for script in page_scripts:
             if script != embed_script:
-                context.eval(script)
-        data = json.loads(context.eval("""JSON.stringify({embed:embedOptions,pages:pages,
+                evaluate(script)
+        data = json.loads(evaluate("""JSON.stringify({embed:embedOptions,pages:pages,
             fonts:fonts, fontHosts:docManager.fontAggregatorHosts,
             assetPrefix:docManager.assetPrefix})"""))
-    except quickjs.JSException as exc:
+    except (quickjs.JSException, TypeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not decode document metadata: {exc}") from exc
-    options, pages = data["embed"], data["pages"]
-    document = options.get("document", {}) if isinstance(options, dict) else {}
-    count = document.get("page_count")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 1 or not pages:
+    if not isinstance(data, dict):
+        raise ValueError("Invalid Scribd document metadata")
+    options, pages, fonts = data.get("embed"), data.get("pages"), data.get("fonts")
+    document = options.get("document") if isinstance(options, dict) else None
+    count = document.get("page_count") if isinstance(document, dict) else None
+    if (type(count) is not int or not 1 <= count <= MAX_PAGES
+            or not isinstance(pages, list) or not pages):
         raise ValueError("Document metadata has no valid page count or page descriptions")
-    if data["fonts"]:
-        options["font_data"] = {"fonts": data["fonts"], "hosts": data.get("fontHosts"),
+    if not isinstance(fonts, list):
+        raise ValueError("Invalid Scribd font metadata")
+    if fonts:
+        options["font_data"] = {"fonts": fonts, "hosts": data.get("fontHosts"),
                                 "asset_prefix": data.get("assetPrefix")}
     return options, pages
