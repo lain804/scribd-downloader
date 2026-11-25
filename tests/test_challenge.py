@@ -66,6 +66,7 @@ def browser(monkeypatch):
         status=200,
         navigation=True,
         closed=False,
+        sandbox=None,
         navigation_options=None,
         navigation_error=False,
     )
@@ -111,6 +112,7 @@ def browser(monkeypatch):
     class Browser:
         def __init__(self, **kwargs):
             self.context = self
+            state.sandbox = kwargs["additional_args"]["chromium_sandbox"]
 
         async def new_page(self):
             return Page()
@@ -129,7 +131,7 @@ def test_challenge_returns_original_navigation_html(browser):
     result = asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 5))
     assert result == browser.contents
     assert browser.navigation_options == {"wait_until": "commit", "timeout": 5000}
-    assert browser.closed
+    assert browser.closed and browser.sandbox
 
 
 @pytest.mark.parametrize(

@@ -261,7 +261,8 @@ def parse_page(root, number: int, base_url: str) -> Page:
                 classes = node.get("class", "").split()
                 if not {"a", "g"}.intersection(classes):
                     node.set("class", " ".join([*classes, "a"]))
-            if node.tag in {"script", "iframe", "object", "embed", "link", "img"}:
+            if node.tag in {"script", "iframe", "object", "embed", "link", "img", "style",
+                            "meta", "base", "form", "input", "button", "select", "textarea"}:
                 node.drop_tree()
             elif hidden(node):
                 node.drop_tree()
@@ -587,7 +588,7 @@ async def _ensure_chromium() -> None:
     output, _ = await process.communicate()
     if process.returncode:
         raise RuntimeError(
-            "Could not install Chromium for the browser challenge: "
+            "Could not install Chromium: "
             + output.decode("utf-8", errors="replace").strip()
         )
 
@@ -597,7 +598,9 @@ async def _pass_client_challenge(url: str, timeout: int) -> bytes:
     from scrapling.fetchers import AsyncStealthySession
 
     await _ensure_chromium()
-    async with AsyncStealthySession(headless=True, timeout=timeout * 1000) as browser:
+    async with AsyncStealthySession(
+        headless=True, timeout=timeout * 1000, additional_args={"chromium_sandbox": True},
+    ) as browser:
         page = await browser.context.new_page()
         responses = asyncio.Queue()
 

@@ -101,9 +101,9 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
 
     contents = BytesIO()
     with pikepdf.Pdf.new() as result, sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = playwright.chromium.launch(headless=True, chromium_sandbox=True)
         try:
-            context = browser.new_context(java_script_enabled=False)
+            context = browser.new_context(java_script_enabled=False, service_workers="block")
             tab = context.new_page()
             # All assets are embedded. Never fetch resources from document HTML.
             tab.route("**/*", lambda route: route.abort())
@@ -134,7 +134,10 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
                 with pikepdf.Pdf.open(BytesIO(data)) as rendered:
                     if len(rendered.pages) != 1:
                         raise ValueError(f"Page {source.number}: text renderer produced extra pages")
-                    result.pages.append(rendered.pages[0])
+                    page = rendered.pages[0]
+                    if "/Annots" in page.obj:
+                        del page.obj["/Annots"]
+                    result.pages.append(page)
                 if on_progress is not None:
                     on_progress("Assembling PDF", index + 1, len(pages))
             result.save(contents)
