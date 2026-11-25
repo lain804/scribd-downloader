@@ -1,4 +1,3 @@
-from io import BytesIO
 import shutil
 import subprocess
 
@@ -93,10 +92,9 @@ def test_clipping_position_scale_transparency_and_page_edges(tmp_path):
         assert rendered.getpixel((60, 60)) == (255, 255, 255)
 
 
-def test_oversized_image_is_rejected_before_decoding(monkeypatch):
-    contents = BytesIO()
+def test_oversized_image_is_rejected_before_decoding(monkeypatch, tmp_path):
     with Image.new("RGB", (1, 1)) as image:
-        image.save(contents, format="PNG")
+        source = asset(tmp_path, image)
     original = Image.open
 
     def oversized(*args, **kwargs):
@@ -111,7 +109,14 @@ def test_oversized_image_is_rejected_before_decoding(monkeypatch):
 
     monkeypatch.setattr(Image, "open", oversized)
     with pytest.raises(ValueError, match="40 million pixels"):
-        pages._validate_asset(contents.getvalue(), "https://example.com/large.png")
+        pages._validate_asset(source, "https://example.com/large.png")
+
+
+def test_image_downloader_rejects_non_raster_formats(tmp_path):
+    with Image.new("RGB", (2, 2)) as image:
+        source = asset(tmp_path, image, "EPS")
+    with pytest.raises(ValueError, match="Could not read image"):
+        pages._validate_asset(source, "https://example.com/source")
 
 
 def test_span_own_font_size_is_used():

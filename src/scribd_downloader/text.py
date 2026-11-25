@@ -24,36 +24,40 @@ async def download_text_style(session, root, font_data, base_url, concurrency):
     # application stylesheets, scripts, tracking and lazy-loading machinery.
     styles = [node.text or "" for node in root.xpath("//style")
               if ".text_layer" in (node.text or "")]
-    css = [VIEWER_CSS, *styles]
     if not font_data:
-        # The renderer checks font classes from inline and fetched pages alike.
-        return "\n".join(css)
+        return "\n".join(styles)
 
     from .pages import _gather_cancel, _get, _image_url
 
     hosts, prefix = font_data.get("hosts"), font_data.get("asset_prefix")
-    if not hosts or not prefix:
+    if (not isinstance(hosts, list) or not hosts or not isinstance(hosts[0], str)
+            or not hosts[0] or not isinstance(prefix, str) or not prefix):
         raise ValueError("Document font metadata has no asset host or prefix")
-    pending = iter(font_data["fonts"])
+    fonts = font_data["fonts"]
+    font_rules = [""] * len(fonts)
+    pending = iter(enumerate(fonts))
 
     async def worker():
-        for font in pending:
-            family, weight, style = font["family"], font["weight"], font["style"]
-            if (not re.fullmatch(r"ff\d+", family)
-                    or weight not in {"normal", "bold", "400", "700"}
-                    or style not in {"normal", "italic", "oblique"}):
+        for index, font in pending:
+            if not isinstance(font, dict):
+                raise ValueError("Invalid embedded font declaration")
+            family, weight, style, font_id = (font.get(key) for key in ("family", "weight", "style", "id"))
+            if (not isinstance(family, str) or not re.fullmatch(r"ff[0-9]+", family)
+                    or weight not in ("normal", "bold", "400", "700")
+                    or style not in ("normal", "italic", "oblique")
+                    or type(font_id) is not int or font_id < 0):
                 raise ValueError(f"Unsupported embedded font declaration: {font!r}")
-            url = _image_url(base_url, f"{hosts[0]}/{prefix}/fonts/{font['id']:04d}.woff2")
-            contents = await _get(session, url, headers={"Referer": base_url})
+            url = _image_url(base_url, f"{hosts[0].rstrip('/')}/{prefix.strip('/')}/fonts/{font_id:04d}.woff2")
+            contents, _ = await _get(session, url, base_url=base_url)
             encoded = base64.b64encode(contents).decode("ascii")
-            css.append(
+            font_rules[index] = (
                 f"@font-face {{ font-family:{family}; font-weight:{weight}; font-style:{style};"
                 f"src:url(data:font/woff2;base64,{encoded}) format('woff2'); }}\n"
                 f"div.{family} span {{ font-family:{family}; font-weight:{weight}; font-style:{style}; }}"
             )
 
-    await _gather_cancel(*(worker() for _ in range(min(concurrency, len(font_data["fonts"])))))
-    return "\n".join(css)
+    await _gather_cancel(*(worker() for _ in range(min(concurrency, len(fonts)))))
+    return "\n".join([*styles, *font_rules])
 
 
 def text_document(pages, viewer_width, text_style):

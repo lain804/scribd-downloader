@@ -46,14 +46,14 @@ def test_original_font_asset_is_embedded_and_failure_propagates(monkeypatch):
                  "fonts": [{"id": 0, "family": "ff0", "weight": "bold", "style": "italic"}]}
     calls = []
 
-    async def get(session, url, *, headers):
-        calls.append((url, headers))
-        return b"original font bytes"
+    async def get(session, url, *, base_url):
+        calls.append((url, base_url))
+        return b"original font bytes", url
 
     monkeypatch.setattr(pages, "_get", get)
     css = asyncio.run(download_text_style(object(), root, font_data, "https://example.com/", 2))
     assert calls == [("https://html.scribdassets.com/assets/fonts/0000.woff2",
-                      {"Referer": "https://example.com/"})]
+                      "https://example.com/")]
     assert base64.b64encode(b"original font bytes").decode() in css
     assert "font-weight:bold; font-style:italic" in css
     assert ".text_layer .w { display:inline-block }" in css

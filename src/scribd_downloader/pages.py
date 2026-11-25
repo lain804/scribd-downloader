@@ -13,6 +13,7 @@ import re
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from time import perf_counter
+from typing import BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 import img2pdf
@@ -30,6 +31,9 @@ MAX_CONCURRENCY = 32
 VIEWER_WIDTH = 1000
 JSONP = re.compile(r"\s*(?:window\.)?page(\d+)_callback\s*\((\[.*\])\)\s*;?\s*", re.S)
 CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
+MAX_EMBED_BYTES = 32 * 1024 * 1024
+MAX_ASSET_BYTES = 64 * 1024 * 1024
+RASTER_FORMATS = ("AVIF", "BMP", "GIF", "ICO", "JPEG", "JPEG2000", "PNG", "TIFF", "WEBP")
 INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -113,13 +117,34 @@ def _text_color(value: str | None) -> tuple[float, float, float] | None:
 
 
 def _image_url(base: str, value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Scribd asset URL must be a string")
     url = urljoin(base, value)
     # Scribd's browser viewer substitutes this CDN host.
     if url.startswith("http://html.scribd.com/"):
         url = url.replace("http://html.scribd.com/", "https://html.scribdassets.com/", 1)
-    if urlsplit(url).scheme not in {"https", "http"}:
-        raise ValueError(f"Unsupported page image URL: {url}")
+    scheme, host, port = _http_origin(url)
+    if scheme == "http" and port == 80 and _trusted_origin(("https", host, 443)):
+        url = urlsplit(url)._replace(scheme="https", netloc=host).geturl()
     return url
+
+
+def _http_origin(url: str) -> tuple[str, str, int]:
+    parts = urlsplit(url)
+    if (parts.scheme not in {"https", "http"} or not parts.hostname
+            or parts.username is not None or "\\" in url
+            or " " in parts.netloc or any(ord(char) < 32 or ord(char) == 127 for char in url)):
+        raise ValueError(f"Invalid HTTP URL: {url!r}")
+    port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+    return parts.scheme, parts.hostname, port
+
+
+def _trusted_origin(origin: tuple[str, str, int]) -> bool:
+    scheme, host, port = origin
+    return scheme == "https" and port == 443 and (
+        host in {"scribd.com", "scribdassets.com"}
+        or host.endswith((".scribd.com", ".scribdassets.com"))
+    )
 
 
 def _scan_ocr(style: dict[str, str]) -> bool:
@@ -358,10 +383,39 @@ def _parse_jsonp(source: str, number: int):
     return html.fromstring(payload[0])
 
 
-async def _get(session: AsyncSession, url: str, *, headers=None) -> bytes:
-    response = await session.get(url, headers=headers)
-    response.raise_for_status()
-    return response.content
+async def _get(
+    session: AsyncSession, url: str, *, base_url: str, headers=None,
+    limit: int = 16 * 1024 * 1024, allow_challenge: bool = False, sink: BinaryIO | None = None,
+) -> tuple[bytes, str]:
+    origin = _http_origin(base_url)
+    headers = {"Referer": base_url, **(headers or {})}
+    body = sink if sink is not None else BytesIO()
+    for _ in range(6):
+        target = _http_origin(url)
+        if target != origin and not _trusted_origin(target):
+            raise ValueError(f"Untrusted Scribd asset or redirect URL: {url!r}")
+        received = 0
+
+        def receive(chunk):
+            nonlocal received
+            received += len(chunk)
+            if received > limit:
+                raise ValueError(f"Scribd response exceeds {limit:,} bytes: {url!r}")
+            return body.write(chunk)
+
+        response = await session.get(url, headers=headers, allow_redirects=False,
+                                     content_callback=receive)
+        location = response.headers.get("Location")
+        if response.status_code in {301, 302, 303, 307, 308} and location:
+            body.seek(0)
+            body.truncate()
+            url = _image_url(response.url, location)
+            continue
+        contents = body.getvalue() if isinstance(body, BytesIO) else b""
+        if not (allow_challenge and CLIENT_CHALLENGE in contents):
+            response.raise_for_status()
+        return contents, response.url
+    raise ValueError("Too many redirects while fetching Scribd content")
 
 
 async def _gather_cancel(*coroutines):
@@ -423,16 +477,17 @@ async def _fetch_pages(
 
     async def worker():
         for number, chunk_url in pending:
-            contents = await _get(session, chunk_url, headers={"Referer": base_url})
-            add_page(number, _parse_jsonp(contents.decode("utf-8-sig"), number), chunk_url)
+            contents, effective_url = await _get(session, chunk_url, base_url=base_url)
+            add_page(number, _parse_jsonp(contents.decode("utf-8-sig"), number), effective_url)
 
     await _gather_cancel(*(worker() for _ in range(min(concurrency, len(missing)))))
     return pages
 
 
-def _validate_asset(contents: bytes, url: str) -> None:
+def _validate_asset(path: Path, url: str) -> None:
     try:
-        with Image.open(BytesIO(contents)) as image:
+        # Pillow can also open EPS, which invokes Ghostscript when decoded.
+        with Image.open(path, formats=RASTER_FORMATS) as image:
             # Check headers before any pixel decoding/allocation.
             if image.width * image.height > 40_000_000:
                 raise ValueError("image exceeds 40 million pixels")
@@ -453,7 +508,6 @@ async def _download_assets(
     if on_progress is not None:
         on_progress("Downloading pages", 0, count)
     image_headers = {
-        "Referer": url,
         # PDF can embed JPEG/PNG directly. Negotiating WebP/AVIF forces a
         # decode and lossless transcode, often much larger than the source.
         "Accept": "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
@@ -486,9 +540,11 @@ async def _download_assets(
     async def worker():
         nonlocal completed
         while (asset_url := await pending.get()) is not None:
-            contents = await _get(session, asset_url, headers=image_headers)
-            _validate_asset(contents, asset_url)
-            assets[asset_url].write_bytes(contents)
+            asset = assets[asset_url]
+            with asset.open("wb") as sink:
+                await _get(session, asset_url, base_url=url, headers=image_headers,
+                           limit=MAX_ASSET_BYTES, sink=sink)
+            _validate_asset(asset, asset_url)
             if on_progress is not None:
                 downloaded.add(asset_url)
                 before = completed
@@ -568,19 +624,18 @@ async def download_pdf(
         raise ValueError("Concurrency must be an integer between 1 and 256")
     started = perf_counter()
     request_headers = {
-        "Referer": url,
         "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
     }
     async with AsyncSession(
         impersonate="chrome", timeout=timeout, max_clients=concurrency, headers=request_headers,
     ) as session:
-        embed_response = await session.get(url)
-        embed_contents = embed_response.content
+        embed_contents, url = await _get(session, url, base_url=url, limit=MAX_EMBED_BYTES,
+                                         allow_challenge=True)
         if CLIENT_CHALLENGE in embed_contents:
             logger.info("Scribd requires a browser challenge; opening headless Chromium")
             embed_contents = await _pass_client_challenge(url, timeout)
-        else:
-            embed_response.raise_for_status()
+            if len(embed_contents) > MAX_EMBED_BYTES:
+                raise ValueError(f"Scribd response exceeds {MAX_EMBED_BYTES:,} bytes")
         try:
             root = html.fromstring(embed_contents.decode("utf-8-sig"))
             options, metadata = extract_embed_data(root)

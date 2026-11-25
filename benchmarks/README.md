@@ -45,9 +45,9 @@ direct embedding retains the entire source asset even when only part is visible.
   image requests with remaining page-description requests.
 - A shared curl connection pool limits all HTTP requests. The default increased
   from 16 to 32 and can be set with `--concurrency`.
-- Fixed worker counts replace one asyncio task per page/image. Downloads are
-  spooled to temporary files, limiting simultaneous response buffers to the worker
-  count; assembly still retains encoded image streams internally.
+- Fixed worker counts replace one asyncio task per page or image. Image responses
+  stream directly into temporary files. Assembly still retains encoded image
+  streams internally.
 - Inline page parsing uses individual page nodes, avoiding repeated full-document
   XPath searches. Relative chunk URLs are resolved before requesting them.
 - Failures cancel and await sibling tasks before closing the session and removing

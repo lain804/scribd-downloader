@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
@@ -7,8 +8,10 @@ import subprocess
 import sys
 from threading import Lock, Thread
 from time import sleep
+from types import SimpleNamespace
 
 from PIL import Image
+from curl_cffi.requests import AsyncSession
 from lxml import html
 from pypdf import PdfReader
 import pytest
@@ -58,15 +61,35 @@ def document_server():
             if self.path == "/embed":
                 body = pages.CLIENT_CHALLENGE if state["challenge"] else state["html"]
                 status = state["embed_status"]
-            elif self.path == "/page2":
-                body = ("page2_callback(" + json.dumps([page(2)]) + ");").encode()
-            elif self.path == "/image.png":
+            elif self.path == "/page2" and state.get("redirect_chunk"):
+                self.send_response(302)
+                self.send_header("Location", "/chunks/page2")
+                self.end_headers()
+                return
+            elif self.path in {"/page2", "/chunks/page2"}:
+                markup = page(2)
+                if self.path == "/chunks/page2":
+                    markup = markup.replace('orig="/image.png"', 'orig="image.png"')
+                body = ("page2_callback(" + json.dumps([markup]) + ");").encode()
+            elif self.path == "/compressed":
+                body = gzip.compress(b"x" * 16384)
+            elif self.path == "/chunks/image.png":
+                body = b"This is a redirect response"
+                self.send_response(302)
+                self.send_header("Location", "/alternate/image.png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            elif self.path in {"/image.png", "/alternate/image.png"}:
                 body = image_bytes.getvalue()
                 if state["fail_asset"]:
                     status, body = 503, b"Image unavailable"
             else:
                 status, body = 404, b"Not found"
             self.send_response(status)
+            if self.path == "/compressed":
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -158,6 +181,55 @@ def test_http_error_without_challenge_does_not_launch_browser(
     assert not list(tmp_path.iterdir())
 
 
+def test_relative_asset_uses_redirected_chunk_location(tmp_path, document_server):
+    document_server["redirect_chunk"] = True
+    output = tmp_path / "document.pdf"
+    assert asyncio.run(pages.download_pdf(document_server["url"], output)) == 2
+    assert "/chunks/image.png" in document_server["requests"]
+    assert "/alternate/image.png" in document_server["requests"]
+
+
+def test_download_limit_applies_to_decompressed_body(document_server):
+    async def run():
+        base = document_server["url"]
+        url = pages._image_url(base, "/compressed")
+        async with AsyncSession() as session:
+            with pytest.raises(ValueError, match="exceeds 1,024 bytes"):
+                await pages._get(session, url, base_url=base, limit=1024)
+            contents, _ = await pages._get(session, url, base_url=base, limit=16384)
+        assert len(contents) == 16384
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("url", ["https://assets.example.org/image", "http://scribdassets.com/image"])
+def test_asset_request_validates_origin_before_using_session(url):
+    async def run():
+        with pytest.raises(ValueError, match="Untrusted Scribd"):
+            await pages._get(object(), url, base_url="https://www.scribd.com/embeds/1/content")
+
+    asyncio.run(run())
+
+
+def test_asset_redirect_is_validated_before_following():
+    base = "https://www.scribd.com/embeds/1/content"
+    asset = "https://html.scribdassets.com/image.png"
+
+    class Session:
+        calls = []
+
+        async def get(self, url, *, allow_redirects, **kwargs):
+            assert not allow_redirects
+            self.calls.append(url)
+            return SimpleNamespace(status_code=302, url=url,
+                                   headers={"Location": "https://assets.example.org/image.png"})
+
+    session = Session()
+    with pytest.raises(ValueError, match="Untrusted Scribd"):
+        asyncio.run(pages._get(session, asset, base_url=base))
+    assert session.calls == [asset]
+
+
 def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch, tmp_path):
     def page(number):
         return f'''<div id="page{number}" style="width:40px;height:60px">
@@ -176,21 +248,22 @@ def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch
         first_image = asyncio.Event()
         third_chunk = asyncio.Event()
 
-        async def get(session, url, *, headers=None):
+        async def get(session, url, *, base_url, headers=None, limit=None, sink=None):
             requests.append(url)
             if url.endswith("/page2"):
                 # Would time out with the old fetch-all-chunks-first pipeline.
                 await asyncio.wait_for(first_image.wait(), 2)
                 await asyncio.wait_for(third_chunk.wait(), 2)
                 completed_chunks.append(2)
-                return ("page2_callback(" + json.dumps([page(2)]) + ");").encode()
+                return ("page2_callback(" + json.dumps([page(2)]) + ");").encode(), url
             if url.endswith("/page3"):
                 third_chunk.set()
                 completed_chunks.append(3)
-                return ("page3_callback(" + json.dumps([page(3)]) + ");").encode()
+                return ("page3_callback(" + json.dumps([page(3)]) + ");").encode(), url
             assert "image/webp" not in headers["Accept"]
             first_image.set()
-            return contents.getvalue()
+            sink.write(contents.getvalue())
+            return b"", url
 
         monkeypatch.setattr(pages, "_get", get)
         return await pages._download_assets(
@@ -356,17 +429,18 @@ def test_progress_waits_for_all_assets_and_handles_shared_cached_and_text_pages(
             if done == 2:
                 cached_page_ready.set()
 
-        async def get(session, url, *, headers=None):
+        async def get(session, url, *, base_url, headers=None, limit=None, sink=None):
             if url.endswith("/page2"):
                 await asyncio.wait_for(image_a.wait(), 2)
                 page = '''<div id="page2" style="width:40px;height:60px">
                     <img class="absimg" src="/a.png" style="width:40px;height:60px"></div>'''
-                return ("page2_callback(" + json.dumps([page]) + ");").encode()
+                return ("page2_callback(" + json.dumps([page]) + ");").encode(), url
             if url.endswith("/a.png"):
                 image_a.set()
             else:
                 await asyncio.wait_for(cached_page_ready.wait(), 2)
-            return buffer.getvalue()
+            sink.write(buffer.getvalue())
+            return b"", url
 
         monkeypatch.setattr(pages, "_get", get)
         await pages._download_assets(object(), root, metadata, 3, "https://example.com/embed",
