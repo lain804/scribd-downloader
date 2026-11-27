@@ -2,6 +2,9 @@ from argparse import ArgumentParser, ArgumentTypeError
 from pathlib import Path
 
 
+DEFAULT_JOBS = 4
+
+
 def _concurrency(value: str) -> int:
     try:
         result = int(value)
@@ -18,6 +21,8 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--no-progress", action="store_true", help="Hide the terminal progress bar")
     parser.add_argument("-j", "--concurrency", type=_concurrency, default=32,
                         help="Maximum simultaneous HTTP requests across all documents (1-256, default: 32)")
+    parser.add_argument("--jobs", type=int,
+                        help=f"Maximum simultaneous documents with --file (default: {DEFAULT_JOBS})")
     parser.add_argument("-f", "--file", type=Path,
                         help="UTF-8 file containing one Scribd URL per line")
     parser.add_argument("-d", "--output-dir", type=Path,

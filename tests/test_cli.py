@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 import sys
@@ -5,6 +6,44 @@ import sys
 import pytest
 
 from scribd_downloader import __main__ as cli
+
+
+@pytest.mark.parametrize("jobs,expected_peak", [(None, 4), (1, 1), (6, 6), (8, 6)])
+def test_batch_jobs_sets_document_concurrency(monkeypatch, tmp_path, jobs, expected_peak):
+    source = tmp_path / "links.txt"
+    source.write_text("".join(f"https://www.scribd.com/doc/{number}\n" for number in range(1, 7)))
+    active = peak = 0
+
+    async def download(session, url, **kwargs):
+        nonlocal active, peak
+        assert session.max_clients == 2
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return 1
+
+    arguments = ["scribd-downloader", "--file", str(source), "-j", "2", "-d", str(tmp_path)]
+    if jobs is not None:
+        arguments += ["--jobs", str(jobs)]
+    monkeypatch.setattr(sys, "argv", arguments)
+    monkeypatch.setattr(cli, "_download_pdf", download)
+    cli.main()
+    assert peak == expected_peak
+
+
+@pytest.mark.parametrize("arguments,expected_error", [
+    (["--file", "links.txt", "--jobs", "0"], "--jobs must be a positive integer"),
+    (["--file", "links.txt", "--jobs", "-1"], "--jobs must be a positive integer"),
+    (["--file", "links.txt", "--jobs", "1.5"], "invalid int value"),
+    (["https://www.scribd.com/doc/1", "--jobs", "4"], "--jobs requires --file"),
+])
+def test_invalid_batch_jobs_is_rejected(monkeypatch, capsys, arguments, expected_error):
+    monkeypatch.setattr(sys, "argv", ["scribd-downloader", *arguments])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert expected_error in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("directory", [None, "downloads"])

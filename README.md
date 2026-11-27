@@ -19,6 +19,7 @@ pip install git+https://github.com/lain804/scribd-downloader.git
 ```sh
 scribd-downloader <scribd-url>
 scribd-downloader --file links.txt --output-dir downloads
+scribd-downloader --file links.txt --jobs 8 -j 32
 scribd-downloader --help
 ```
 
@@ -36,9 +37,10 @@ for an image. Title-based filenames receive a numeric suffix on collisions.
 On POSIX, title-based output paths need a filesystem that supports hard links.
 An explicit output path replaces the file at that path.
 
-Batch mode works on up to four documents at once and reports progress by
-document. The batch shares one HTTP connection pool and one request limit.
-Use `-j` to set that limit (default 32).
+Batch mode works on up to four documents at once by default and reports progress
+by document. Use `--jobs` to set the number of simultaneous documents.
+The batch shares one HTTP connection pool with a separate request limit set by
+`-j` (default 32).
 
 HTTP 429 and HTTP 503 with a valid `Retry-After` pause requests to the responding
 origin while other origins continue. The downloader retries up to three times.

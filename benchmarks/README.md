@@ -52,8 +52,8 @@ twelfth page, median assembly over three runs fell from 2.03 s at `053589b` to
   images are still downloading.
 - A shared curl connection pool limits all HTTP requests. The default increased
   from 16 to 32 and can be set with `--concurrency`.
-- Batch mode shares that pool across up to four documents. A local HTTP/1.1
-  fixture with twelve one-page image documents, two requests per document and
+- Batch mode shares that pool across up to four documents by default. A local
+  HTTP/1.1 fixture with twelve one-page image documents, two requests per document and
   40 ms of server delay per request took 0.560 s versus 1.663 s at `5bd207a`
   (median of three runs, `-j 32`).
 - Fixed worker counts replace one asyncio task per page or image. Image responses

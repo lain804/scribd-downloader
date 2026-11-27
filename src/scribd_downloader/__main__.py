@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import sys
 
-from scribd_downloader.cli import build_parser
+from scribd_downloader.cli import DEFAULT_JOBS, build_parser
 from scribd_downloader.constants import DOCUMENT_ID_SEARCH_PATTERN
 from scribd_downloader.pages import _download_pdf, _DownloadSession, _gather_cancel, download_pdf
 from scribd_downloader.progress import ProgressBar, ProgressLoggingHandler
@@ -39,7 +39,9 @@ def _read_batch(path: Path):
     return documents, invalid, duplicates
 
 
-async def _download_batch(documents, output_dir: Path, concurrency: int, show_progress: bool = True):
+async def _download_batch(
+    documents, output_dir: Path, concurrency: int, show_progress: bool = True, *, jobs: int = DEFAULT_JOBS,
+):
     saved = 0
     failed = 0
     pending = iter(documents)
@@ -71,7 +73,7 @@ async def _download_batch(documents, output_dir: Path, concurrency: int, show_pr
                         update("Downloading", saved + failed, len(documents))
 
             # Bound concurrent assemblies and Chromium instances as well as HTTP requests.
-            await _gather_cancel(*(worker() for _ in range(min(4, len(documents)))))
+            await _gather_cancel(*(worker() for _ in range(min(jobs, len(documents)))))
     return saved, failed
 
 
@@ -88,6 +90,11 @@ def main():
         parser.error("Provide either a Scribd URL or --file LINKS_FILE")
     if args.output is not None and args.output_dir is not None:
         parser.error("Choose either an output PDF path or --output-dir")
+    if args.jobs is not None:
+        if args.file is None:
+            parser.error("--jobs requires --file")
+        if args.jobs < 1:
+            parser.error("--jobs must be a positive integer")
     if args.file is not None:
         try:
             documents, invalid, duplicates = _read_batch(args.file)
@@ -102,6 +109,7 @@ def main():
             parser.error(f"Could not create output directory {output_dir}: {exc}")
         saved, failed = asyncio.run(_download_batch(
             documents, output_dir, args.concurrency, show_progress=not args.no_progress,
+            jobs=args.jobs or DEFAULT_JOBS,
         ))
         failed += invalid
         print(f"Saved {saved} documents to {output_dir}; {failed} failed; {duplicates} duplicates skipped")

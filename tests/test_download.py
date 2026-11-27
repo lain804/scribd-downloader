@@ -569,7 +569,7 @@ def test_batch_shares_connections_and_preserves_colliding_outputs(monkeypatch, t
 
     monkeypatch.setattr(cli, "_download_pdf", download)
     documents = [(f"https://www.scribd.com/doc/{number}", str(number)) for number in range(1, 7)]
-    assert asyncio.run(cli._download_batch(documents, tmp_path, 2)) == (6, 0)
+    assert asyncio.run(cli._download_batch(documents, tmp_path, 2, jobs=6)) == (6, 0)
     assert document_server["peak"] == 2
     outputs = sorted(tmp_path.glob("*.pdf"))
     assert len(outputs) == 6
