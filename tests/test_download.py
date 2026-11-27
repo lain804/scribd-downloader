@@ -8,11 +8,11 @@ import os
 import subprocess
 import sys
 from threading import Barrier, Event, Lock, Thread
-from time import sleep
+from time import monotonic, sleep
 from types import SimpleNamespace
 
 from PIL import Image
-from curl_cffi.requests import AsyncSession
+from curl_cffi.requests import Response
 from lxml import html
 from pypdf import PdfReader
 import pytest
@@ -59,6 +59,7 @@ def document_server():
             state["requests"].append(self.path)
             sleep(state["delay"])
             status = 200
+            headers = {}
             if self.path == "/embed":
                 body = pages.CLIENT_CHALLENGE if state["challenge"] else state["html"]
                 status = state["embed_status"]
@@ -84,11 +85,16 @@ def document_server():
                 return
             elif self.path in {"/image.png", "/alternate/image.png"}:
                 body = image_bytes.getvalue()
-                if state["fail_asset"]:
+                if state.get("throttle_asset") and state["requests"].count(self.path) == 1:
+                    status, body = 429, b"Try again after this error body."
+                    headers["Retry-After"] = "0"
+                elif state["fail_asset"]:
                     status, body = 503, b"Image unavailable"
             else:
                 status, body = 404, b"Not found"
             self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
             if self.path == "/compressed":
                 self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
@@ -194,7 +200,7 @@ def test_download_limit_applies_to_decompressed_body(document_server):
     async def run():
         base = document_server["url"]
         url = pages._image_url(base, "/compressed")
-        async with AsyncSession() as session:
+        async with pages._DownloadSession() as session:
             with pytest.raises(ValueError, match="exceeds 1,024 bytes"):
                 await pages._get(session, url, base_url=base, limit=1024)
             contents, _ = await pages._get(session, url, base_url=base, limit=16384)
@@ -216,19 +222,118 @@ def test_asset_redirect_is_validated_before_following():
     base = "https://www.scribd.com/embeds/1/content"
     asset = "https://html.scribdassets.com/image.png"
 
-    class Session:
-        calls = []
+    calls = []
 
-        async def get(self, url, *, allow_redirects, **kwargs):
+    async def run():
+        async def get(url, *, allow_redirects, **kwargs):
             assert not allow_redirects
-            self.calls.append(url)
+            calls.append(url)
             return SimpleNamespace(status_code=302, url=url,
                                    headers={"Location": "https://assets.example.org/image.png"})
 
-    session = Session()
+        async with pages._DownloadSession() as session:
+            session.get = get
+            await pages._get(session, asset, base_url=base)
+
     with pytest.raises(ValueError, match="Untrusted Scribd"):
-        asyncio.run(pages._get(session, asset, base_url=base))
-    assert session.calls == [asset]
+        asyncio.run(run())
+    assert calls == [asset]
+
+
+def test_retried_download_truncates_image_error_body(tmp_path, document_server):
+    document_server["throttle_asset"] = True
+    base = document_server["url"]
+    url = pages._image_url(base, "/image.png")
+    asset = tmp_path / "image.png"
+
+    async def run():
+        async with pages._DownloadSession() as session:
+            with asset.open("wb") as sink:
+                await pages._get(session, url, base_url=base, sink=sink)
+            assert document_server["requests"].count("/image.png") == 2
+            contents, _ = await pages._get(session, url, base_url=base)
+            assert asset.read_bytes() == contents
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("value,expected", [
+    (" 3 ", 3), ("Thu, 01 Jan 1970 00:00:12 GMT", 2),
+    ("Thu Jan  1 00:00:08 1970", 0), ("invalid", None),
+])
+def test_retry_after_delays(monkeypatch, value, expected):
+    monkeypatch.setattr(pages, "time", lambda: 10)
+    assert pages._retry_after(value) == expected
+
+
+@pytest.mark.parametrize("status,retry_after,attempts", [(429, "0", 4), (429, "3600", 1), (503, "", 1)])
+def test_retry_budget_and_long_cooldown(status, retry_after, attempts):
+    url = "https://www.scribd.com/embed"
+    calls = []
+
+    async def run():
+        async def get(url, **kwargs):
+            calls.append(url)
+            response = Response()
+            response.status_code = status
+            response.ok = False
+            response.headers["Retry-After"] = retry_after
+            return response
+
+        async with pages._DownloadSession() as session:
+            session.get = get
+            with pytest.raises(HTTPError):
+                await pages._get(session, url, base_url=url)
+            if retry_after == "3600":
+                with pytest.raises(HTTPError, match="cooldown"):
+                    await pages._get(session, url + "/other", base_url=url)
+
+    asyncio.run(run())
+    assert len(calls) == attempts
+
+
+@pytest.mark.parametrize("status,retry_after,delay", [(429, "", 0.5), (503, "1", 1)])
+def test_rate_limit_pauses_queued_requests_only_for_affected_origin(monkeypatch, status, retry_after, delay):
+    base = "https://www.scribd.com/embed"
+    cdn = "https://html.scribdassets.com/image.png"
+    other = "https://www.scribd.com/other"
+    calls = []
+    monkeypatch.setattr(pages, "uniform", lambda *_: 0)
+
+    async def run():
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def get(url, **kwargs):
+            response = Response()
+            response.url = url
+            response.status_code = 200
+            if not calls:
+                assert url == base
+                calls.append((url, monotonic()))
+                started.set()
+                await finish.wait()
+                response.status_code = status
+                response.headers["Retry-After"] = retry_after
+            else:
+                calls.append((url, monotonic()))
+            return response
+
+        async with pages._DownloadSession(concurrency=1) as session:
+            session.get = get
+            first = asyncio.create_task(pages._get(session, base, base_url=base))
+            await started.wait()
+            second = asyncio.create_task(pages._get(session, other, base_url=base))
+            third = asyncio.create_task(pages._get(session, cdn, base_url=base))
+            released = monotonic()
+            finish.set()
+            await asyncio.gather(first, second, third)
+        return released
+
+    released = asyncio.run(run())
+    assert calls[1][0] == cdn
+    assert {url for url, _ in calls[2:]} == {base, other}
+    assert all(when >= released + delay for _, when in calls[2:])
 
 
 def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch, tmp_path):

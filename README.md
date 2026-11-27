@@ -35,3 +35,9 @@ responses at 32 MiB for the embed, 16 MiB for a page chunk or font, and 64 MiB
 for an image. Title-based filenames receive a numeric suffix on collisions.
 On POSIX, title-based output paths need a filesystem that supports hard links.
 An explicit output path replaces the file at that path.
+
+HTTP 429 and HTTP 503 with a valid `Retry-After` pause requests to the responding
+origin while other origins continue. The downloader retries up to three times.
+A 429 without a usable header uses exponential backoff with jitter. If the
+server asks for more than 60 seconds, the download reports the error without
+retrying early.

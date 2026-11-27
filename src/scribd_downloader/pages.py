@@ -1,8 +1,11 @@
 """Download Scribd page chunks and place their original images in a PDF."""
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 import json
 import logging
@@ -10,15 +13,17 @@ import math
 import ntpath
 import os
 from pathlib import Path
+from random import uniform
 import re
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from time import perf_counter
+from time import monotonic, perf_counter, time
 from typing import BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 import img2pdf
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import HTTPError
 from lxml import html
 from PIL import Image
 import pikepdf
@@ -29,6 +34,8 @@ from .extractor import extract_embed_data
 
 logger = logging.getLogger(__name__)
 MAX_CONCURRENCY = 32
+MAX_RATE_LIMIT_RETRIES = 3
+MAX_RETRY_WAIT = 60
 VIEWER_WIDTH = 1000
 JSONP = re.compile(r"\s*(?:window\.)?page(\d+)_callback\s*\((\[.*\])\)\s*;?\s*", re.S)
 CLIENT_CHALLENGE = b"<title>Client Challenge</title>"
@@ -37,6 +44,42 @@ MAX_ASSET_BYTES = 64 * 1024 * 1024
 RASTER_FORMATS = ("AVIF", "BMP", "GIF", "ICO", "JPEG", "JPEG2000", "PNG", "TIFF", "WEBP")
 INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 ProgressCallback = Callable[[str, int, int], None]
+
+
+class _DownloadSession(AsyncSession):
+    def __init__(self, timeout: int = 30, concurrency: int = MAX_CONCURRENCY):
+        super().__init__(
+            impersonate="chrome", timeout=timeout, max_clients=concurrency,
+            headers={"Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8"},
+        )
+        self.slots = asyncio.Semaphore(concurrency)
+        self.cooldowns: dict[tuple[str, str, int], float] = {}
+
+    @asynccontextmanager
+    async def request_slot(self, origin):
+        while True:
+            async with self.slots:
+                delay = self.cooldowns.get(origin, 0) - monotonic()
+                if delay <= 0:
+                    yield
+                    return
+            if delay > MAX_RETRY_WAIT:
+                raise HTTPError(f"{origin[1]} requested a cooldown longer than {MAX_RETRY_WAIT}s")
+            # Spread queued requests out when a shared cooldown ends.
+            await asyncio.sleep(delay + uniform(0, 0.25))
+
+
+def _retry_after(value: str) -> float | None:
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return float(value)
+    try:
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=UTC)
+        return max(0, date.timestamp() - time())
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def _default_output_path(title: str, directory: Path | None = None) -> Path:
@@ -397,13 +440,14 @@ def _parse_jsonp(source: str, number: int):
 
 
 async def _get(
-    session: AsyncSession, url: str, *, base_url: str, headers=None,
+    session: _DownloadSession, url: str, *, base_url: str, headers=None,
     limit: int = 16 * 1024 * 1024, allow_challenge: bool = False, sink: BinaryIO | None = None,
 ) -> tuple[bytes, str]:
     origin = _http_origin(base_url)
     headers = {"Referer": base_url, **(headers or {})}
     body = sink if sink is not None else BytesIO()
-    for _ in range(6):
+    redirects = retries = 0
+    while True:
         target = _http_origin(url)
         if target != origin and not _trusted_origin(target):
             raise ValueError(f"Untrusted Scribd asset or redirect URL: {url!r}")
@@ -416,10 +460,27 @@ async def _get(
                 raise ValueError(f"Scribd response exceeds {limit:,} bytes: {url!r}")
             return body.write(chunk)
 
-        response = await session.get(url, headers=headers, allow_redirects=False,
-                                     content_callback=receive)
+        async with session.request_slot(target):
+            response = await session.get(url, headers=headers, allow_redirects=False,
+                                         content_callback=receive)
+            retry_after = response.headers.get("Retry-After", "")
+            delay = _retry_after(retry_after) if retry_after else None
+            if response.status_code == 429 or (response.status_code == 503 and delay is not None):
+                if delay is None:
+                    delay = 0.5 * 2**retries + uniform(0, 0.25)
+                session.cooldowns[target] = max(session.cooldowns.get(target, 0), monotonic() + delay)
+                if retries == MAX_RATE_LIMIT_RETRIES or delay > MAX_RETRY_WAIT:
+                    response.raise_for_status()
+                retries += 1
+                logger.info("%s returned HTTP %d, retrying in %.2fs", target[1], response.status_code, delay)
+                body.seek(0)
+                body.truncate()
+                continue
         location = response.headers.get("Location")
         if response.status_code in {301, 302, 303, 307, 308} and location:
+            if redirects == 5:
+                raise ValueError("Too many redirects while fetching Scribd content")
+            redirects += 1
             body.seek(0)
             body.truncate()
             url = _image_url(response.url, location)
@@ -428,7 +489,6 @@ async def _get(
         if not (allow_challenge and CLIENT_CHALLENGE in contents):
             response.raise_for_status()
         return contents, response.url
-    raise ValueError("Too many redirects while fetching Scribd content")
 
 
 async def _gather_cancel(*coroutines):
@@ -444,7 +504,7 @@ async def _gather_cancel(*coroutines):
 
 
 async def _fetch_pages(
-    session: AsyncSession, root, metadata, count: int, base_url: str,
+    session: _DownloadSession, root, metadata, count: int, base_url: str,
     *, concurrency: int = MAX_CONCURRENCY, on_page=None,
 ) -> list[Page]:
     by_number = {}
@@ -638,12 +698,7 @@ async def download_pdf(
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 256:
         raise ValueError("Concurrency must be an integer between 1 and 256")
     started = perf_counter()
-    request_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
-    }
-    async with AsyncSession(
-        impersonate="chrome", timeout=timeout, max_clients=concurrency, headers=request_headers,
-    ) as session:
+    async with _DownloadSession(timeout, concurrency) as session:
         embed_contents, url = await _get(session, url, base_url=url, limit=MAX_EMBED_BYTES,
                                          allow_challenge=True)
         if CLIENT_CHALLENGE in embed_contents:
