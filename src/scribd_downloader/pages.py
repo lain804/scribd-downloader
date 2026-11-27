@@ -1,7 +1,7 @@
 """Download Scribd page chunks and place their original images in a PDF."""
 import asyncio
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC
@@ -55,12 +55,40 @@ class _DownloadSession(AsyncSession):
         self.cooldowns: dict[tuple[str, str, int], float] = {}
         self.chromium_lock = asyncio.Lock()
         self.chromium_ready = False
+        self.browser_resources = AsyncExitStack()
+        self.playwright = None
+        self.text_browser = None
 
     async def ensure_chromium(self):
         async with self.chromium_lock:
-            if not self.chromium_ready:
-                await _ensure_chromium()
-                self.chromium_ready = True
+            await self._browser_driver()
+
+    async def _browser_driver(self):
+        if self.playwright is None:
+            from patchright.async_api import async_playwright
+
+            self.playwright = await self.browser_resources.enter_async_context(async_playwright())
+        if not self.chromium_ready:
+            await _ensure_chromium(Path(self.playwright.chromium.executable_path))
+            self.chromium_ready = True
+        return self.playwright
+
+    async def render_text(self, pages, viewer_width, text_style, *, on_progress=None):
+        from .text import render_text_with_browser
+
+        async with self.chromium_lock:
+            if self.text_browser is None or not self.text_browser.is_connected():
+                playwright = await self._browser_driver()
+                self.text_browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True)
+                self.browser_resources.push_async_callback(self.text_browser.close)
+            browser = self.text_browser
+        return await render_text_with_browser(browser, pages, viewer_width, text_style, on_progress=on_progress)
+
+    async def close(self):
+        try:
+            await self.browser_resources.aclose()
+        finally:
+            await super().close()
 
     @asynccontextmanager
     async def request_slot(self, origin):
@@ -323,12 +351,14 @@ def parse_page(root, number: int, base_url: str) -> Page:
 
 def _text_pdf(
     pages: list[Page], *, on_progress: ProgressCallback | None = None, text_style: str = "",
+    render_text=None,
 ) -> BytesIO:
     """Create small PDF pages containing only the source's visible HTML text."""
     if any(page.text_html and page.text_runs for page in pages):
-        from .text import render_text_pdf
+        if render_text is None:
+            from .text import render_text_pdf as render_text
 
-        return render_text_pdf(pages, VIEWER_WIDTH, text_style, on_progress=on_progress)
+        return render_text(pages, VIEWER_WIDTH, text_style, on_progress=on_progress)
     contents = BytesIO()
     overlay = Canvas(contents, pageCompression=1)
     for number, page in enumerate(pages, 1):
@@ -365,7 +395,7 @@ def _text_pdf(
 def _assemble_pdf(
     pages: list[Page], assets: dict[str, Path], directory: Path, title: str,
     *, on_progress: ProgressCallback | None = None, destination: Path | None = None,
-    text_style: str = "",
+    text_style: str = "", render_text=None,
 ) -> Path:
     """Embed each asset once, then reconstruct CSS clipping using PDF commands.
 
@@ -378,7 +408,8 @@ def _assemble_pdf(
         on_progress("Assembling PDF", 0, len(pages))
     staged = destination if destination is not None else directory / "document.pdf"
     if not urls:
-        with pikepdf.Pdf.open(_text_pdf(pages, on_progress=on_progress, text_style=text_style)) as document:
+        text = _text_pdf(pages, on_progress=on_progress, text_style=text_style, render_text=render_text)
+        with pikepdf.Pdf.open(text) as document:
             document.docinfo["/Title"] = title
             document.save(staged, object_stream_mode=pikepdf.ObjectStreamMode.generate)
         return staged
@@ -389,7 +420,8 @@ def _assemble_pdf(
             engine=img2pdf.Engine.internal, rotation=img2pdf.Rotation.none,
             first_frame_only=True, title=title,
         )
-    with pikepdf.Pdf.open(native) as document, pikepdf.Pdf.open(_text_pdf(pages, text_style=text_style)) as text:
+    overlay = _text_pdf(pages, text_style=text_style, render_text=render_text)
+    with pikepdf.Pdf.open(native) as document, pikepdf.Pdf.open(overlay) as text:
         images = {
             url: asset_page.Resources.XObject.Im0
             for url, asset_page in zip(urls, document.pages, strict=True)
@@ -637,14 +669,11 @@ async def _download_assets(
     return results[0], assets
 
 
-async def _ensure_chromium() -> None:
-    from patchright.async_api import async_playwright
-
+async def _ensure_chromium(executable: Path) -> None:
     # Check the browser revision required by Patchright, rather than relying
     # on Scrapling's install marker or Playwright's potentially different revision.
-    async with async_playwright() as playwright:
-        if Path(playwright.chromium.executable_path).is_file():
-            return
+    if executable.is_file():
+        return
     logger.warning("Installing Chromium for Scribd text rendering and browser challenges; this may take a few minutes")
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "patchright", "install", "chromium",
@@ -756,8 +785,6 @@ async def _download_pdf(
             return await download_text_style(session, root, options.get("font_data"), url, concurrency)
 
         (pages, assets), text_style = await _gather_cancel(fetch_assets(), fetch_styles())
-        if needs_text.result():
-            await session.ensure_chromium()
         fetched = perf_counter()
         logger.info(
             "Fetched %d unique images for %d pages in %.2fs",
@@ -771,10 +798,18 @@ async def _download_pdf(
             with NamedTemporaryFile(prefix="scribd-", suffix=".pdf", dir=output.parent,
                                     delete=False) as stream:
                 staged = Path(stream.name)
+        loop = asyncio.get_running_loop()
+
+        def render_text(pages, viewer_width, text_style, *, on_progress=None):
+            # Assembly runs in a worker thread, while Patchright belongs to the session's event loop.
+            return asyncio.run_coroutine_threadsafe(
+                session.render_text(pages, viewer_width, text_style, on_progress=on_progress), loop,
+            ).result()
+
         try:
             assembly = asyncio.create_task(asyncio.to_thread(
                 _assemble_pdf, pages, assets, directory, document_title,
-                on_progress=on_progress, destination=staged, text_style=text_style,
+                on_progress=on_progress, destination=staged, text_style=text_style, render_text=render_text,
             ))
             try:
                 await asyncio.shield(assembly)

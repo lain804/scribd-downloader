@@ -1,4 +1,5 @@
 """Render Scribd's native text with its original fonts and CSS geometry."""
+import asyncio
 import base64
 from html import escape
 from io import BytesIO
@@ -96,23 +97,37 @@ section:last-child { break-after:auto }
 
 
 def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
-    from patchright.sync_api import sync_playwright
+    from patchright.async_api import async_playwright
+
+    async def render():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True)
+            try:
+                return await render_text_with_browser(
+                    browser, pages, viewer_width, text_style, on_progress=on_progress,
+                )
+            finally:
+                await browser.close()
+
+    return asyncio.run(render())
+
+
+async def render_text_with_browser(browser, pages, viewer_width, text_style, *, on_progress=None):
     import pikepdf
 
     contents = BytesIO()
     print_pages = [page for page in pages if page.text_runs]
-    with pikepdf.Pdf.new() as result, sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, chromium_sandbox=True)
+    with pikepdf.Pdf.new() as result:
+        context = await browser.new_context(java_script_enabled=False, service_workers="block")
         try:
-            context = browser.new_context(java_script_enabled=False, service_workers="block")
-            tab = context.new_page()
+            tab = await context.new_page()
             # All assets are embedded. Never fetch resources from document HTML.
-            tab.route("**/*", lambda route: route.abort())
-            tab.set_content(text_document(print_pages, viewer_width, text_style), wait_until="load")
-            tab.emulate_media(media="screen")
+            await tab.route("**/*", lambda route: route.abort())
+            await tab.set_content(text_document(print_pages, viewer_width, text_style), wait_until="load")
+            await tab.emulate_media(media="screen")
             # Loading failure is fatal: falling back changes glyph widths and
             # can also expose codepoints meant only for a custom subset font.
-            tab.evaluate("""async () => {
+            await tab.evaluate("""async () => {
                 const declared = new Set([...document.fonts].map(f => f.family));
                 for (const node of document.querySelectorAll('.text_layer [class]')) {
                     for (const name of node.classList) {
@@ -131,11 +146,13 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
             printed = 0
             for index, source in enumerate(pages, 1):
                 if source.text_runs:
-                    tab.evaluate("index => { const page = document.body.children[index]; "
-                                 "if (page.previousElementSibling) page.previousElementSibling.style.display = 'none'; "
-                                 "page.style.display = 'block'; }", printed)
+                    await tab.evaluate(
+                        "index => { const page = document.body.children[index]; "
+                        "if (page.previousElementSibling) page.previousElementSibling.style.display = 'none'; "
+                        "page.style.display = 'block'; }", printed,
+                    )
                     printed += 1
-                    data = tab.pdf(prefer_css_page_size=True, print_background=True)
+                    data = await tab.pdf(prefer_css_page_size=True, print_background=True)
                     with pikepdf.Pdf.open(BytesIO(data)) as rendered:
                         if len(rendered.pages) != 1:
                             raise ValueError(f"Page {source.number}: text renderer did not produce one page")
@@ -150,6 +167,6 @@ def render_text_pdf(pages, viewer_width, text_style, *, on_progress=None):
                     on_progress("Assembling PDF", index, len(pages))
             result.save(contents)
         finally:
-            browser.close()
+            await context.close()
     contents.seek(0)
     return contents

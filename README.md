@@ -41,6 +41,8 @@ Batch mode works on up to four documents at once by default and reports progress
 by document. Use `--jobs` to set the number of simultaneous documents.
 The batch shares one HTTP connection pool with a separate request limit set by
 `-j` (default 32).
+Chromium starts on demand for native text and stays open until the batch ends.
+Each document renders in its own browser context with network access blocked.
 
 HTTP 429 and HTTP 503 with a valid `Retry-After` pause requests to the responding
 origin while other origins continue. The downloader retries up to three times.

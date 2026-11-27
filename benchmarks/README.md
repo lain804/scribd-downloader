@@ -56,6 +56,10 @@ twelfth page, median assembly over three runs fell from 2.03 s at `053589b` to
   HTTP/1.1 fixture with twelve one-page image documents, two requests per document and
   40 ms of server delay per request took 0.560 s versus 1.663 s at `5bd207a`
   (median of three runs, `-j 32`).
+- An eight-document local batch with one native-text page per document took
+  1.071 s versus 2.814 s at `818ded4` (median of three runs, `--jobs 4`).
+  Each run launched Chromium once instead of eight times. Both measurements
+  used a test-only sandbox override for the local fixture.
 - Fixed worker counts replace one asyncio task per page or image. Image responses
   stream directly into temporary files opened only after a request gets a slot.
   Assembly still retains encoded image streams internally.

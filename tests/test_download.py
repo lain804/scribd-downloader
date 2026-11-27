@@ -407,11 +407,7 @@ def test_visible_text_fonts_download_while_images_are_pending(monkeypatch, tmp_p
             fonts_loaded.set()
             return "test font CSS"
 
-        async def ensure_chromium():
-            pass
-
         monkeypatch.setattr(pages, "_get", wait_for_fonts)
-        monkeypatch.setattr(pages, "_ensure_chromium", ensure_chromium)
         monkeypatch.setattr(text, "download_text_style", fetch_fonts)
         return await pages.download_pdf(document_server["url"], tmp_path / "result.pdf")
 
@@ -555,6 +551,12 @@ def test_connection_limit_is_shared_by_chunks_and_images(tmp_path, document_serv
 
 
 def test_batch_shares_connections_and_preserves_colliding_outputs(monkeypatch, tmp_path, document_server):
+    from patchright import async_api
+
+    async def unexpected_launch(*args, **kwargs):
+        pytest.fail("Image-only batches should not launch Chromium")
+
+    monkeypatch.setattr(async_api.BrowserType, "launch", unexpected_launch)
     document_server["delay"] = 0.05
     document_server["html"] = b'''<div id="page1" style="width:40px;height:60px">
         <img class="absimg" src="/image.png" style="width:40px;height:60px"></div>
@@ -574,6 +576,42 @@ def test_batch_shares_connections_and_preserves_colliding_outputs(monkeypatch, t
     outputs = sorted(tmp_path.glob("*.pdf"))
     assert len(outputs) == 6
     assert all(len(PdfReader(pdf).pages) == 1 for pdf in outputs)
+
+
+def test_batch_reuses_text_browser_with_separate_contexts(monkeypatch, tmp_path, document_server):
+    from patchright import async_api
+
+    browsers, contexts, closed_contexts = [], [], []
+    launch = async_api.BrowserType.launch
+    new_context = async_api.Browser.new_context
+
+    async def track_launch(self, **kwargs):
+        assert kwargs["chromium_sandbox"]
+        browser = await launch(self, **kwargs)
+        browsers.append(browser)
+        return browser
+
+    async def track_context(self, **kwargs):
+        assert kwargs == {"java_script_enabled": False, "service_workers": "block"}
+        context = await new_context(self, **kwargs)
+        contexts.append(context)
+        context.on("close", lambda closed: closed_contexts.append(closed))
+        return context
+
+    async def download(session, url, **kwargs):
+        return await pages._download_pdf(session, document_server["url"], **kwargs)
+
+    monkeypatch.setattr(async_api.BrowserType, "launch", track_launch)
+    monkeypatch.setattr(async_api.Browser, "new_context", track_context)
+    monkeypatch.setattr(cli, "_download_pdf", download)
+    documents = [(f"https://www.scribd.com/doc/{number}", str(number)) for number in range(1, 5)]
+    assert asyncio.run(cli._download_batch(documents, tmp_path, 4, jobs=2)) == (4, 0)
+    assert len(browsers) == 1 and not browsers[0].is_connected()
+    assert len(set(contexts)) == 4
+    assert set(closed_contexts) == set(contexts)
+    assert len(list(tmp_path.glob("*.pdf"))) == 4
+    for pdf in tmp_path.glob("*.pdf"):
+        assert "Page 1 visible text" in PdfReader(pdf).pages[0].extract_text()
 
 
 def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path):

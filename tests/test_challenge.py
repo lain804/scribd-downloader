@@ -23,20 +23,17 @@ class BrowserDriver:
 def test_existing_chromium_does_not_install(monkeypatch, tmp_path):
     executable = tmp_path / "chrome.exe"
     executable.touch()
-    monkeypatch.setattr(async_api, "async_playwright", lambda: BrowserDriver(executable))
 
     async def unexpected_install(*args, **kwargs):
         pytest.fail("An existing browser must not trigger installation")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_install)
-    asyncio.run(pages._ensure_chromium())
+    asyncio.run(pages._ensure_chromium(executable))
 
 
 @pytest.mark.parametrize("returncode", [0, 1])
 def test_missing_chromium_installs_with_tool_python(monkeypatch, tmp_path, returncode):
-    monkeypatch.setattr(
-        async_api, "async_playwright", lambda: BrowserDriver(tmp_path / "missing.exe")
-    )
+    executable = tmp_path / "missing.exe"
     commands = []
 
     class Installer:
@@ -53,9 +50,9 @@ def test_missing_chromium_installs_with_tool_python(monkeypatch, tmp_path, retur
     monkeypatch.setattr(asyncio, "create_subprocess_exec", install)
     if returncode:
         with pytest.raises(RuntimeError, match="Could not install Chromium.*Browser download failed"):
-            asyncio.run(pages._ensure_chromium())
+            asyncio.run(pages._ensure_chromium(executable))
     else:
-        asyncio.run(pages._ensure_chromium())
+        asyncio.run(pages._ensure_chromium(executable))
     assert commands == [(sys.executable, "-m", "patchright", "install", "chromium")]
 
 
@@ -151,11 +148,11 @@ def test_navigation_timeout_closes_browser(browser):
     assert browser.closed
 
 
-def test_shared_session_checks_chromium_once(monkeypatch):
+def test_shared_session_checks_chromium_once(monkeypatch, tmp_path):
     calls = []
 
-    async def ensure():
-        calls.append(None)
+    async def ensure(executable):
+        calls.append(executable)
         await asyncio.sleep(0)
 
     async def run():
@@ -163,5 +160,7 @@ def test_shared_session_checks_chromium_once(monkeypatch):
             await asyncio.gather(session.ensure_chromium(), session.ensure_chromium())
 
     monkeypatch.setattr(pages, "_ensure_chromium", ensure)
+    executable = tmp_path / "chrome"
+    monkeypatch.setattr(async_api, "async_playwright", lambda: BrowserDriver(executable))
     asyncio.run(run())
-    assert len(calls) == 1
+    assert calls == [executable]
