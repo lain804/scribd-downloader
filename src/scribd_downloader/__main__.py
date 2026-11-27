@@ -72,7 +72,7 @@ async def _download_batch(
                     if update is not None:
                         update("Downloading", saved + failed, len(documents))
 
-            # Bound concurrent assemblies and Chromium instances as well as HTTP requests.
+            # Bound concurrent assemblies and browser pages as well as HTTP requests.
             await _gather_cancel(*(worker() for _ in range(min(jobs, len(documents)))))
     return saved, failed
 

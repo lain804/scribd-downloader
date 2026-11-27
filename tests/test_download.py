@@ -130,7 +130,7 @@ def test_download_assembles_all_pages_without_replaying_challenge(
     state["embed_status"] = status
     calls = []
 
-    async def browser(url, timeout):
+    async def browser(session, url):
         calls.append(url)
         return state["html"]
 

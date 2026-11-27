@@ -66,7 +66,20 @@ def browser(monkeypatch):
         sandbox=None,
         navigation_options=None,
         navigation_error=False,
+        discard_challenge_body=False,
+        launches=0,
+        checked=[],
+        opened_pages=[],
+        closed_pages=[],
     )
+    executable = "/test/chromium"
+
+    async def check_chromium(path):
+        state.checked.append(str(path))
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(pages, "_ensure_chromium", check_chromium)
+    monkeypatch.setattr(async_api, "async_playwright", lambda: BrowserDriver(executable))
 
     class Page:
         main_frame = object()
@@ -90,6 +103,9 @@ def browser(monkeypatch):
             self.handler(Response(object(), True))
             self.handler(Response(self.main_frame, False))
 
+        async def close(self):
+            state.closed_pages.append(self)
+
     class Response:
         def __init__(self, frame, navigation, contents=None):
             self.frame = frame
@@ -99,6 +115,8 @@ def browser(monkeypatch):
 
         async def body(self):
             assert not state.closed, "Read response bytes before closing the browser"
+            if state.discard_challenge_body and self.contents == pages.CLIENT_CHALLENGE:
+                raise async_api.Error("Network.getResponseBody: No resource with given identifier found")
             return state.contents if self.contents is None else self.contents
 
     class Browser:
@@ -106,10 +124,16 @@ def browser(monkeypatch):
             self.context = self
             state.sandbox = kwargs["additional_args"]["chromium_sandbox"]
 
+        def is_closed(self):
+            return state.closed
+
         async def new_page(self):
-            return Page()
+            page = Page()
+            state.opened_pages.append(page)
+            return page
 
         async def __aenter__(self):
+            state.launches += 1
             return self
 
         async def __aexit__(self, *args):
@@ -119,8 +143,13 @@ def browser(monkeypatch):
     return state
 
 
+async def run_challenge(timeout):
+    async with pages._DownloadSession(timeout=timeout) as session:
+        return await pages._pass_client_challenge(session, "https://www.scribd.com/embeds/1/content")
+
+
 def test_challenge_returns_original_navigation_html(browser):
-    result = asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 5))
+    result = asyncio.run(run_challenge(5))
     assert result == browser.contents
     assert browser.navigation_options == {"wait_until": "commit", "timeout": 5000}
     assert browser.closed and browser.sandbox
@@ -137,30 +166,39 @@ def test_challenge_returns_original_navigation_html(browser):
 def test_browser_failures_are_reported(browser, contents, status, navigation, message):
     browser.contents, browser.status, browser.navigation = contents, status, navigation
     with pytest.raises(RuntimeError, match=message):
-        asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 0.01))
+        asyncio.run(run_challenge(0.01))
+    assert browser.closed_pages == browser.opened_pages
     assert browser.closed
 
 
 def test_navigation_timeout_closes_browser(browser):
     browser.navigation_error = True
     with pytest.raises(RuntimeError, match="did not complete successfully"):
-        asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 0.01))
+        asyncio.run(run_challenge(0.01))
+    assert browser.closed_pages == browser.opened_pages
     assert browser.closed
 
 
-def test_shared_session_checks_chromium_once(monkeypatch, tmp_path):
-    calls = []
-
-    async def ensure(executable):
-        calls.append(executable)
-        await asyncio.sleep(0)
+def test_batch_challenges_reuse_one_browser_and_close_each_tab(browser):
+    browser.discard_challenge_body = True
 
     async def run():
         async with pages._DownloadSession() as session:
-            await asyncio.gather(session.ensure_chromium(), session.ensure_chromium())
+            contents = await asyncio.gather(*(
+                pages._pass_client_challenge(session, f"https://www.scribd.com/embeds/{number}/content")
+                for number in (1, 2)
+            ))
+            assert contents == [browser.contents, browser.contents]
+            url = "https://www.scribd.com/embeds/3/content"
+            browser.navigation_error = True
+            with pytest.raises(RuntimeError, match="did not complete successfully"):
+                await pages._pass_client_challenge(session, url)
+            browser.navigation_error = False
+            assert await pages._pass_client_challenge(session, url) == browser.contents
+            assert not browser.closed
+            assert len(browser.closed_pages) == len(browser.opened_pages) == 4
+            assert set(browser.closed_pages) == set(browser.opened_pages)
 
-    monkeypatch.setattr(pages, "_ensure_chromium", ensure)
-    executable = tmp_path / "chrome"
-    monkeypatch.setattr(async_api, "async_playwright", lambda: BrowserDriver(executable))
     asyncio.run(run())
-    assert calls == [executable]
+    assert browser.closed and browser.launches == 1
+    assert browser.checked == ["/test/chromium"]

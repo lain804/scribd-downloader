@@ -43,6 +43,8 @@ The batch shares one HTTP connection pool with a separate request limit set by
 `-j` (default 32).
 Chromium starts on demand for native text and stays open until the batch ends.
 Each document renders in its own browser context with network access blocked.
+When Scribd requests a browser challenge, the batch reuses a separate browser
+session with a fresh tab for each challenge.
 
 HTTP 429 and HTTP 503 with a valid `Retry-After` pause requests to the responding
 origin while other origins continue. The downloader retries up to three times.
