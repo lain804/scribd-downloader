@@ -578,7 +578,7 @@ def _validate_asset(path: Path, url: str) -> None:
 
 async def _download_assets(
     session, root, metadata, count, url, directory, concurrency,
-    *, on_progress: ProgressCallback | None = None,
+    *, on_progress: ProgressCallback | None = None, on_page: Callable[[Page], None] | None = None,
 ):
     assets = {}
     pending = asyncio.Queue()
@@ -596,6 +596,8 @@ async def _download_assets(
 
     def enqueue(page):
         nonlocal completed
+        if on_page is not None:
+            on_page(page)
         for placement in page.placements:
             if placement.url not in assets:
                 assets[placement.url] = directory / f"asset-{len(assets):06d}.image"
@@ -737,16 +739,30 @@ async def _download_pdf(
     temporary_parent = None if sys.platform == "win32" else output.parent
     with TemporaryDirectory(prefix="scribd-", dir=temporary_parent) as temporary:
         directory = Path(temporary)
-        pages, assets = await _download_assets(
-            session, root, metadata, count, url, directory, concurrency,
-            on_progress=on_progress,
-        )
-        text_style = ""
-        if any(page.text_html and page.text_runs for page in pages):
+        needs_text = asyncio.get_running_loop().create_future()
+
+        def detect_text(page):
+            if page.text_html and page.text_runs and not needs_text.done():
+                needs_text.set_result(True)
+
+        async def fetch_assets():
+            document = await _download_assets(
+                session, root, metadata, count, url, directory, concurrency,
+                on_progress=on_progress, on_page=detect_text,
+            )
+            if not needs_text.done():
+                needs_text.set_result(False)
+            return document
+
+        async def fetch_styles():
+            if not await needs_text:
+                return ""
             from .text import download_text_style
 
-            text_style = await download_text_style(session, root, options.get("font_data"),
-                                                   url, concurrency)
+            return await download_text_style(session, root, options.get("font_data"), url, concurrency)
+
+        (pages, assets), text_style = await _gather_cancel(fetch_assets(), fetch_styles())
+        if needs_text.result():
             await session.ensure_chromium()
         fetched = perf_counter()
         logger.info(

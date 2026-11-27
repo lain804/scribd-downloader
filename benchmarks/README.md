@@ -48,6 +48,8 @@ twelfth page, median assembly over three runs fell from 2.03 s at `053589b` to
 
 - Images are queued as soon as inline or fetched page data is parsed, overlapping
   image requests with remaining page-description requests.
+- The first visible text page starts fetching fonts while other pages and
+  images are still downloading.
 - A shared curl connection pool limits all HTTP requests. The default increased
   from 16 to 32 and can be set with `--concurrency`.
 - Fixed worker counts replace one asyncio task per page or image. Image responses

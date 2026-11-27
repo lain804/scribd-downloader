@@ -384,6 +384,43 @@ def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch
     assert all(path.read_bytes() == contents.getvalue() for path in assets.values())
 
 
+def test_visible_text_fonts_download_while_images_are_pending(monkeypatch, tmp_path, document_server):
+    from scribd_downloader import text
+
+    get = pages._get
+
+    async def run():
+        image_started = asyncio.Event()
+        fonts_loaded = asyncio.Event()
+
+        async def wait_for_fonts(session, url, **kwargs):
+            if url.endswith("/image.png"):
+                image_started.set()
+                await asyncio.wait_for(fonts_loaded.wait(), 2)
+            return await get(session, url, **kwargs)
+
+        async def fetch_fonts(*args):
+            await asyncio.wait_for(image_started.wait(), 2)
+            fonts_loaded.set()
+            return "test font CSS"
+
+        async def ensure_chromium():
+            pass
+
+        monkeypatch.setattr(pages, "_get", wait_for_fonts)
+        monkeypatch.setattr(pages, "_ensure_chromium", ensure_chromium)
+        monkeypatch.setattr(text, "download_text_style", fetch_fonts)
+        return await pages.download_pdf(document_server["url"], tmp_path / "result.pdf")
+
+    def assemble(document, assets, directory, title, *, destination, text_style, **kwargs):
+        assert text_style == "test font CSS"
+        assert len(document) == 2 and len(assets) == 1
+        destination.write_bytes(b"staged")
+
+    monkeypatch.setattr(pages, "_assemble_pdf", assemble)
+    assert asyncio.run(run()) == 2
+
+
 def test_failed_worker_cancels_siblings_before_returning():
     async def run():
         running = asyncio.Event()
