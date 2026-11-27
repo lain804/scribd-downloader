@@ -248,8 +248,7 @@ def test_retried_download_truncates_image_error_body(tmp_path, document_server):
 
     async def run():
         async with pages._DownloadSession() as session:
-            with asset.open("wb") as sink:
-                await pages._get(session, url, base_url=base, sink=sink)
+            await pages._get(session, url, base_url=base, destination=asset)
             assert document_server["requests"].count("/image.png") == 2
             contents, _ = await pages._get(session, url, base_url=base)
             assert asset.read_bytes() == contents
@@ -293,10 +292,11 @@ def test_retry_budget_and_long_cooldown(status, retry_after, attempts):
 
 
 @pytest.mark.parametrize("status,retry_after,delay", [(429, "", 0.5), (503, "1", 1)])
-def test_rate_limit_pauses_queued_requests_only_for_affected_origin(monkeypatch, status, retry_after, delay):
+def test_rate_limit_pauses_queued_requests_only_for_affected_origin(monkeypatch, tmp_path, status, retry_after, delay):
     base = "https://www.scribd.com/embed"
     cdn = "https://html.scribdassets.com/image.png"
     other = "https://www.scribd.com/other"
+    asset = tmp_path / "asset"
     calls = []
     monkeypatch.setattr(pages, "uniform", lambda *_: 0)
 
@@ -316,6 +316,8 @@ def test_rate_limit_pauses_queued_requests_only_for_affected_origin(monkeypatch,
                 response.status_code = status
                 response.headers["Retry-After"] = retry_after
             else:
+                if url == cdn:
+                    assert not asset.exists()
                 calls.append((url, monotonic()))
             return response
 
@@ -323,7 +325,7 @@ def test_rate_limit_pauses_queued_requests_only_for_affected_origin(monkeypatch,
             session.get = get
             first = asyncio.create_task(pages._get(session, base, base_url=base))
             await started.wait()
-            second = asyncio.create_task(pages._get(session, other, base_url=base))
+            second = asyncio.create_task(pages._get(session, other, base_url=base, destination=asset))
             third = asyncio.create_task(pages._get(session, cdn, base_url=base))
             released = monotonic()
             finish.set()
@@ -332,6 +334,7 @@ def test_rate_limit_pauses_queued_requests_only_for_affected_origin(monkeypatch,
 
     released = asyncio.run(run())
     assert calls[1][0] == cdn
+    assert asset.exists()
     assert {url for url, _ in calls[2:]} == {base, other}
     assert all(when >= released + delay for _, when in calls[2:])
 
@@ -354,7 +357,7 @@ def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch
         first_image = asyncio.Event()
         third_chunk = asyncio.Event()
 
-        async def get(session, url, *, base_url, headers=None, limit=None, sink=None):
+        async def get(session, url, *, base_url, headers=None, limit=None, destination=None):
             requests.append(url)
             if url.endswith("/page2"):
                 # Would time out with the old fetch-all-chunks-first pipeline.
@@ -368,7 +371,7 @@ def test_assets_start_before_slow_chunks_finish_and_pages_keep_order(monkeypatch
                 return ("page3_callback(" + json.dumps([page(3)]) + ");").encode(), url
             assert "image/webp" not in headers["Accept"]
             first_image.set()
-            sink.write(contents.getvalue())
+            destination.write_bytes(contents.getvalue())
             return b"", url
 
         monkeypatch.setattr(pages, "_get", get)
@@ -653,7 +656,7 @@ def test_progress_waits_for_all_assets_and_handles_shared_cached_and_text_pages(
             if done == 2:
                 cached_page_ready.set()
 
-        async def get(session, url, *, base_url, headers=None, limit=None, sink=None):
+        async def get(session, url, *, base_url, headers=None, limit=None, destination=None):
             if url.endswith("/page2"):
                 await asyncio.wait_for(image_a.wait(), 2)
                 page = '''<div id="page2" style="width:40px;height:60px">
@@ -663,7 +666,7 @@ def test_progress_waits_for_all_assets_and_handles_shared_cached_and_text_pages(
                 image_a.set()
             else:
                 await asyncio.wait_for(cached_page_ready.wait(), 2)
-            sink.write(buffer.getvalue())
+            destination.write_bytes(buffer.getvalue())
             return b"", url
 
         monkeypatch.setattr(pages, "_get", get)

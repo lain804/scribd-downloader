@@ -18,7 +18,6 @@ import re
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from time import monotonic, perf_counter, time
-from typing import BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 import img2pdf
@@ -449,54 +448,50 @@ def _parse_jsonp(source: str, number: int):
 
 async def _get(
     session: _DownloadSession, url: str, *, base_url: str, headers=None,
-    limit: int = 16 * 1024 * 1024, allow_challenge: bool = False, sink: BinaryIO | None = None,
+    limit: int = 16 * 1024 * 1024, allow_challenge: bool = False, destination: Path | None = None,
 ) -> tuple[bytes, str]:
     origin = _http_origin(base_url)
     headers = {"Referer": base_url, **(headers or {})}
-    body = sink if sink is not None else BytesIO()
     redirects = retries = 0
     while True:
         target = _http_origin(url)
         if target != origin and not _trusted_origin(target):
             raise ValueError(f"Untrusted Scribd asset or redirect URL: {url!r}")
-        received = 0
-
-        def receive(chunk):
-            nonlocal received
-            received += len(chunk)
-            if received > limit:
-                raise ValueError(f"Scribd response exceeds {limit:,} bytes: {url!r}")
-            return body.write(chunk)
-
         async with session.request_slot(target):
-            response = await session.get(url, headers=headers, allow_redirects=False,
-                                         content_callback=receive)
-            retry_after = response.headers.get("Retry-After", "")
-            delay = _retry_after(retry_after) if retry_after else None
-            if response.status_code == 429 or (response.status_code == 503 and delay is not None):
-                if delay is None:
-                    delay = 0.5 * 2**retries + uniform(0, 0.25)
-                session.cooldowns[target] = max(session.cooldowns.get(target, 0), monotonic() + delay)
-                if retries == MAX_RATE_LIMIT_RETRIES or delay > MAX_RETRY_WAIT:
+            with (destination.open("wb") if destination is not None else BytesIO()) as body:
+                received = 0
+
+                def receive(chunk):
+                    nonlocal received
+                    received += len(chunk)
+                    if received > limit:
+                        raise ValueError(f"Scribd response exceeds {limit:,} bytes: {url!r}")
+                    return body.write(chunk)
+
+                response = await session.get(url, headers=headers, allow_redirects=False,
+                                             content_callback=receive)
+                retry_after = response.headers.get("Retry-After", "")
+                delay = _retry_after(retry_after) if retry_after else None
+                if response.status_code == 429 or (response.status_code == 503 and delay is not None):
+                    if delay is None:
+                        delay = 0.5 * 2**retries + uniform(0, 0.25)
+                    session.cooldowns[target] = max(session.cooldowns.get(target, 0), monotonic() + delay)
+                    if retries == MAX_RATE_LIMIT_RETRIES or delay > MAX_RETRY_WAIT:
+                        response.raise_for_status()
+                    retries += 1
+                    logger.info("%s returned HTTP %d, retrying in %.2fs", target[1], response.status_code, delay)
+                    continue
+                location = response.headers.get("Location")
+                if response.status_code in {301, 302, 303, 307, 308} and location:
+                    if redirects == 5:
+                        raise ValueError("Too many redirects while fetching Scribd content")
+                    redirects += 1
+                    url = _image_url(response.url, location)
+                    continue
+                contents = body.getvalue() if isinstance(body, BytesIO) else b""
+                if not (allow_challenge and CLIENT_CHALLENGE in contents):
                     response.raise_for_status()
-                retries += 1
-                logger.info("%s returned HTTP %d, retrying in %.2fs", target[1], response.status_code, delay)
-                body.seek(0)
-                body.truncate()
-                continue
-        location = response.headers.get("Location")
-        if response.status_code in {301, 302, 303, 307, 308} and location:
-            if redirects == 5:
-                raise ValueError("Too many redirects while fetching Scribd content")
-            redirects += 1
-            body.seek(0)
-            body.truncate()
-            url = _image_url(response.url, location)
-            continue
-        contents = body.getvalue() if isinstance(body, BytesIO) else b""
-        if not (allow_challenge and CLIENT_CHALLENGE in contents):
-            response.raise_for_status()
-        return contents, response.url
+                return contents, response.url
 
 
 async def _gather_cancel(*coroutines):
@@ -624,9 +619,8 @@ async def _download_assets(
         nonlocal completed
         while (asset_url := await pending.get()) is not None:
             asset = assets[asset_url]
-            with asset.open("wb") as sink:
-                await _get(session, asset_url, base_url=url, headers=image_headers,
-                           limit=MAX_ASSET_BYTES, sink=sink)
+            await _get(session, asset_url, base_url=url, headers=image_headers,
+                       limit=MAX_ASSET_BYTES, destination=asset)
             _validate_asset(asset, asset_url)
             if on_progress is not None:
                 downloaded.add(asset_url)
