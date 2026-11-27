@@ -2,10 +2,11 @@ import asyncio
 import logging
 from pathlib import Path
 import re
+import sys
 
 from scribd_downloader.cli import build_parser
 from scribd_downloader.constants import DOCUMENT_ID_SEARCH_PATTERN
-from scribd_downloader.pages import download_pdf
+from scribd_downloader.pages import _download_pdf, _DownloadSession, _gather_cancel, download_pdf
 from scribd_downloader.progress import ProgressBar, ProgressLoggingHandler
 
 
@@ -41,20 +42,36 @@ def _read_batch(path: Path):
 async def _download_batch(documents, output_dir: Path, concurrency: int, show_progress: bool = True):
     saved = 0
     failed = 0
-    for number, (url, document_id) in enumerate(documents, 1):
-        try:
-            with ProgressBar(f"Document {number}/{len(documents)}", enabled=show_progress) as on_progress:
-                count = await download_pdf(
-                    f"https://www.scribd.com/embeds/{document_id}/content",
-                    output_dir=output_dir, overwrite=False, concurrency=concurrency,
-                    on_progress=on_progress,
-                )
-        except Exception as exc:
-            logging.error("Download failed for %s: %s", url, exc)
-            failed += 1
-        else:
-            print(f"Saved {url} ({count} pages)")
-            saved += 1
+    pending = iter(documents)
+    progress = ProgressBar("Batch", enabled=show_progress, unit="documents")
+    with progress as update:
+        if update is not None:
+            update("Downloading", 0, len(documents))
+        terminal_output = progress.enabled and sys.stdout.isatty()
+        async with _DownloadSession(concurrency=concurrency) as session:
+            async def worker():
+                nonlocal saved, failed
+                for url, document_id in pending:
+                    try:
+                        count = await _download_pdf(
+                            session, f"https://www.scribd.com/embeds/{document_id}/content",
+                            output_dir=output_dir, overwrite=False,
+                        )
+                    except Exception as exc:
+                        logging.error("Download failed for %s: %s", url, exc)
+                        failed += 1
+                    else:
+                        if terminal_output:
+                            progress.clear()
+                        print(f"Saved {url} ({count} pages)")
+                        if terminal_output:
+                            progress.redraw()
+                        saved += 1
+                    if update is not None:
+                        update("Downloading", saved + failed, len(documents))
+
+            # Bound concurrent assemblies and Chromium instances as well as HTTP requests.
+            await _gather_cancel(*(worker() for _ in range(min(4, len(documents)))))
     return saved, failed
 
 

@@ -54,6 +54,14 @@ class _DownloadSession(AsyncSession):
         )
         self.slots = asyncio.Semaphore(concurrency)
         self.cooldowns: dict[tuple[str, str, int], float] = {}
+        self.chromium_lock = asyncio.Lock()
+        self.chromium_ready = False
+
+    async def ensure_chromium(self):
+        async with self.chromium_lock:
+            if not self.chromium_ready:
+                await _ensure_chromium()
+                self.chromium_ready = True
 
     @asynccontextmanager
     async def request_slot(self, origin):
@@ -658,7 +666,6 @@ async def _pass_client_challenge(url: str, timeout: int) -> bytes:
     from patchright.async_api import TimeoutError as BrowserTimeoutError
     from scrapling.fetchers import AsyncStealthySession
 
-    await _ensure_chromium()
     async with AsyncStealthySession(
         headless=True, timeout=timeout * 1000, additional_args={"chromium_sandbox": True},
     ) as browser:
@@ -697,76 +704,88 @@ async def download_pdf(
         raise ValueError("Choose either an output PDF path or an output directory")
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 256:
         raise ValueError("Concurrency must be an integer between 1 and 256")
-    started = perf_counter()
     async with _DownloadSession(timeout, concurrency) as session:
-        embed_contents, url = await _get(session, url, base_url=url, limit=MAX_EMBED_BYTES,
-                                         allow_challenge=True)
-        if CLIENT_CHALLENGE in embed_contents:
-            logger.info("Scribd requires a browser challenge; opening headless Chromium")
-            embed_contents = await _pass_client_challenge(url, timeout)
-            if len(embed_contents) > MAX_EMBED_BYTES:
-                raise ValueError(f"Scribd response exceeds {MAX_EMBED_BYTES:,} bytes")
-        try:
-            root = html.fromstring(embed_contents.decode("utf-8-sig"))
-            options, metadata = extract_embed_data(root)
-        except Exception as exc:
-            raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc
-        document_title = str(options["document"].get("title") or "")
-        output = Path(output) if output is not None else _default_output_path(document_title, output_dir)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        count = options["document"]["page_count"]
-        temporary_parent = None if sys.platform == "win32" else output.parent
-        with TemporaryDirectory(prefix="scribd-", dir=temporary_parent) as temporary:
-            directory = Path(temporary)
-            pages, assets = await _download_assets(
-                session, root, metadata, count, url, directory, concurrency,
-                on_progress=on_progress,
-            )
-            text_style = ""
-            if any(page.text_html and page.text_runs for page in pages):
-                from .text import download_text_style
+        return await _download_pdf(
+            session, url, output, output_dir=output_dir, overwrite=overwrite, on_progress=on_progress,
+        )
 
-                text_style = await download_text_style(session, root, options.get("font_data"),
-                                                       url, concurrency)
-                await _ensure_chromium()
-            fetched = perf_counter()
-            logger.info(
-                "Fetched %d unique images for %d pages in %.2fs",
-                len(assets), count, fetched - started,
-            )
-            staged = directory / "document.pdf"
-            if sys.platform == "win32":
-                # Python's private temp directory has an owner-only Windows
-                # ACL that survives moving files out. Stage the final PDF next
-                # to its destination so it inherits normal folder permissions.
-                with NamedTemporaryFile(prefix="scribd-", suffix=".pdf", dir=output.parent,
-                                        delete=False) as stream:
-                    staged = Path(stream.name)
+
+async def _download_pdf(
+    session: _DownloadSession, url: str, output: Path | None = None,
+    *, output_dir: Path | None = None, overwrite: bool = True,
+    on_progress: ProgressCallback | None = None,
+) -> int:
+    started = perf_counter()
+    concurrency = session.max_clients
+    embed_contents, url = await _get(session, url, base_url=url, limit=MAX_EMBED_BYTES,
+                                     allow_challenge=True)
+    if CLIENT_CHALLENGE in embed_contents:
+        logger.info("Scribd requires a browser challenge; opening headless Chromium")
+        await session.ensure_chromium()
+        embed_contents = await _pass_client_challenge(url, session.timeout)
+        if len(embed_contents) > MAX_EMBED_BYTES:
+            raise ValueError(f"Scribd response exceeds {MAX_EMBED_BYTES:,} bytes")
+    try:
+        root = html.fromstring(embed_contents.decode("utf-8-sig"))
+        options, metadata = extract_embed_data(root)
+    except Exception as exc:
+        raise RuntimeError(f"Could not read Scribd document metadata: {exc}") from exc
+    document_title = str(options["document"].get("title") or "")
+    output = Path(output) if output is not None else _default_output_path(document_title, output_dir)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    count = options["document"]["page_count"]
+    temporary_parent = None if sys.platform == "win32" else output.parent
+    with TemporaryDirectory(prefix="scribd-", dir=temporary_parent) as temporary:
+        directory = Path(temporary)
+        pages, assets = await _download_assets(
+            session, root, metadata, count, url, directory, concurrency,
+            on_progress=on_progress,
+        )
+        text_style = ""
+        if any(page.text_html and page.text_runs for page in pages):
+            from .text import download_text_style
+
+            text_style = await download_text_style(session, root, options.get("font_data"),
+                                                   url, concurrency)
+            await session.ensure_chromium()
+        fetched = perf_counter()
+        logger.info(
+            "Fetched %d unique images for %d pages in %.2fs",
+            len(assets), count, fetched - started,
+        )
+        staged = directory / "document.pdf"
+        if sys.platform == "win32":
+            # Python's private temp directory has an owner-only Windows
+            # ACL that survives moving files out. Stage the final PDF next
+            # to its destination so it inherits normal folder permissions.
+            with NamedTemporaryFile(prefix="scribd-", suffix=".pdf", dir=output.parent,
+                                    delete=False) as stream:
+                staged = Path(stream.name)
+        try:
+            assembly = asyncio.create_task(asyncio.to_thread(
+                _assemble_pdf, pages, assets, directory, document_title,
+                on_progress=on_progress, destination=staged, text_style=text_style,
+            ))
             try:
-                assembly = asyncio.create_task(asyncio.to_thread(
-                    _assemble_pdf, pages, assets, directory, document_title,
-                    on_progress=on_progress, destination=staged, text_style=text_style,
-                ))
-                try:
-                    await asyncio.shield(assembly)
-                except asyncio.CancelledError:
-                    # The assembly thread still owns the input and staging files.
-                    while not assembly.done():
-                        try:
-                            await asyncio.shield(assembly)
-                        except asyncio.CancelledError:
-                            continue
-                        except Exception:
-                            break
-                    if not assembly.cancelled():
-                        assembly.exception()
-                    raise
-                size = staged.stat().st_size
-                output = staged.replace(output) if overwrite else _publish_new_pdf(staged, output)
-            finally:
-                staged.unlink(missing_ok=True)
-            if on_progress is not None:
-                on_progress("Saved PDF", count, count)
+                await asyncio.shield(assembly)
+            except asyncio.CancelledError:
+                # The assembly thread still owns the input and staging files.
+                while not assembly.done():
+                    try:
+                        await asyncio.shield(assembly)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not assembly.cancelled():
+                    assembly.exception()
+                raise
+            size = staged.stat().st_size
+            output = staged.replace(output) if overwrite else _publish_new_pdf(staged, output)
+        finally:
+            staged.unlink(missing_ok=True)
+        if on_progress is not None:
+            on_progress("Saved PDF", count, count)
     logger.info(
         "Saved %s (%d pages, %.2f MiB); assembly %.2fs, total %.2fs",
         output, count, size / 1024**2, perf_counter() - fetched, perf_counter() - started,

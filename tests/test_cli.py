@@ -19,22 +19,24 @@ def test_batch_reads_bom_skips_blanks_and_deduplicates_documents(monkeypatch, tm
     )
     calls = []
 
-    async def download(url, **kwargs):
-        calls.append((url, kwargs))
+    async def download(session, url, **kwargs):
+        calls.append((session, url, kwargs))
         return 2
 
-    monkeypatch.setattr(cli, "download_pdf", download)
+    monkeypatch.setattr(cli, "_download_pdf", download)
     arguments = ["scribd-downloader", "--file", str(source), "-j", "8"]
     if directory:
         arguments.extend(["--output-dir", directory])
     monkeypatch.setattr(sys, "argv", arguments)
     cli.main()
 
-    assert [url for url, _ in calls] == ["https://www.scribd.com/embeds/123/content",
-                                        "https://www.scribd.com/embeds/456/content"]
-    for _, kwargs in calls:
+    assert [url for _, url, _ in calls] == ["https://www.scribd.com/embeds/123/content",
+                                           "https://www.scribd.com/embeds/456/content"]
+    for session, _, kwargs in calls:
+        assert session is calls[0][0]
+        assert session.max_clients == 8
         assert kwargs == {"output_dir": Path(directory) if directory else tmp_path,
-                          "overwrite": False, "concurrency": 8, "on_progress": None}
+                          "overwrite": False}
     output = capsys.readouterr().out
     assert "Saved 2 documents" in output
     assert "0 failed; 1 duplicates skipped" in output
@@ -46,13 +48,13 @@ def test_batch_continues_after_invalid_links_and_failed_downloads(monkeypatch, t
                       "https://www.scribd.com/doc/2\nhttps://www.scribd.com/doc/3\n")
     calls = []
 
-    async def download(url, **kwargs):
+    async def download(session, url, **kwargs):
         calls.append(url)
         if url.endswith("/2/content"):
             raise RuntimeError("Server unavailable")
         return 1
 
-    monkeypatch.setattr(cli, "download_pdf", download)
+    monkeypatch.setattr(cli, "_download_pdf", download)
     monkeypatch.setattr(sys, "argv", ["scribd-downloader", "-f", str(source)])
     with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as error:
         cli.main()
@@ -77,7 +79,7 @@ def test_unreadable_or_empty_batch_is_reported_before_downloading(monkeypatch, t
     async def unexpected(*args, **kwargs):
         pytest.fail("Invalid input must be rejected before downloading")
 
-    monkeypatch.setattr(cli, "download_pdf", unexpected)
+    monkeypatch.setattr(cli, "_download_pdf", unexpected)
     monkeypatch.setattr(sys, "argv", ["scribd-downloader", "-f", str(source)])
     with pytest.raises(SystemExit) as error:
         cli.main()
@@ -103,7 +105,7 @@ def test_batch_rejects_output_file_as_directory_before_downloading(monkeypatch, 
     async def unexpected(*args, **kwargs):
         pytest.fail("An invalid directory must be rejected before downloading")
 
-    monkeypatch.setattr(cli, "download_pdf", unexpected)
+    monkeypatch.setattr(cli, "_download_pdf", unexpected)
     monkeypatch.setattr(sys, "argv", ["scribd-downloader", "-f", str(source), "-d", str(destination)])
     with pytest.raises(SystemExit) as error:
         cli.main()

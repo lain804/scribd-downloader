@@ -15,9 +15,9 @@ def _concurrency(value: str) -> int:
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(description="Download Scribd documents preserving page images, fonts and layout")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log download and assembly progress")
-    parser.add_argument("--no-progress", action="store_true", help="Hide the terminal page progress bar")
+    parser.add_argument("--no-progress", action="store_true", help="Hide the terminal progress bar")
     parser.add_argument("-j", "--concurrency", type=_concurrency, default=32,
-                        help="Maximum simultaneous HTTP requests (1-256, default: 32)")
+                        help="Maximum simultaneous HTTP requests across all documents (1-256, default: 32)")
     parser.add_argument("-f", "--file", type=Path,
                         help="UTF-8 file containing one Scribd URL per line")
     parser.add_argument("-d", "--output-dir", type=Path,

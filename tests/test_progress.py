@@ -75,7 +75,7 @@ def test_logs_leave_the_progress_bar_visible():
 
 
 @pytest.mark.parametrize("disabled", [False, True])
-def test_batch_bar_shows_document_index_and_can_be_disabled(monkeypatch, tmp_path, disabled):
+def test_batch_bar_shows_document_count_and_can_be_disabled(monkeypatch, tmp_path, disabled):
     stream = Terminal()
     source = tmp_path / "links.txt"
     source.write_text("https://www.scribd.com/doc/1\nhttps://www.scribd.com/doc/2\n")
@@ -86,23 +86,13 @@ def test_batch_bar_shows_document_index_and_can_be_disabled(monkeypatch, tmp_pat
         arguments.append("--no-progress")
     monkeypatch.setattr(sys, "argv", arguments)
 
-    async def download(url, *, on_progress, **kwargs):
-        if disabled:
-            assert on_progress is None
-        else:
-            assert on_progress is not None
-            on_progress("Downloading pages", 0, 3)
-            on_progress("Downloading pages", 3, 3)
-            on_progress("Assembling PDF", 0, 3)
-            on_progress("Assembling PDF", 3, 3)
-            on_progress("Saved PDF", 3, 3)
+    async def download(session, url, **kwargs):
         return 3
 
-    monkeypatch.setattr(cli, "download_pdf", download)
+    monkeypatch.setattr(cli, "_download_pdf", download)
     cli.main()
     if disabled:
         assert stream.getvalue() == ""
     else:
-        assert "Document 1/2: Saved PDF" in stream.getvalue()
-        assert "Document 2/2: Saved PDF" in stream.getvalue()
-        assert stream.getvalue().count("Saved PDF [████████████████████] 3/3 pages") == 2
+        assert "Batch: Downloading [--------------------] 0/2 documents" in stream.getvalue()
+        assert "Batch: Downloading [████████████████████] 2/2 documents" in stream.getvalue()

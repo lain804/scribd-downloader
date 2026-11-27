@@ -7,7 +7,7 @@ from time import perf_counter
 class ProgressBar:
     active = None
 
-    def __init__(self, label: str = "", *, enabled: bool = True, stream=None):
+    def __init__(self, label: str = "", *, enabled: bool = True, stream=None, unit: str = "pages"):
         self.stream = stream if stream is not None else sys.stderr
         self.enabled = enabled and self.stream.isatty()
         self._fill = "█"
@@ -18,6 +18,7 @@ class ProgressBar:
             except UnicodeEncodeError:
                 self._fill = "#"
         self.label = f"{label}: " if label else ""
+        self.unit = unit
         self.phase = ""
         self.completed = self.total = 0
         self._last_draw = 0.0
@@ -51,7 +52,7 @@ class ProgressBar:
         if total:
             filled = min(20, completed * 20 // total)
             bar = self._fill * filled + "-" * (20 - filled)
-            self._line = f"{self.label}{phase} [{bar}] {completed}/{total} pages"
+            self._line = f"{self.label}{phase} [{bar}] {completed}/{total} {self.unit}"
         else:
             self._line = f"{self.label}{phase}..."
         self.redraw()

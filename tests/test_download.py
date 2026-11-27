@@ -18,7 +18,7 @@ from pypdf import PdfReader
 import pytest
 from curl_cffi.requests.exceptions import HTTPError
 
-from scribd_downloader import pages
+from scribd_downloader import __main__ as cli, pages
 
 
 @pytest.fixture
@@ -512,6 +512,28 @@ def test_connection_limit_is_shared_by_chunks_and_images(tmp_path, document_serv
         document_server["url"], tmp_path / "document.pdf", concurrency=concurrency,
     ))
     assert document_server["peak"] == concurrency
+
+
+def test_batch_shares_connections_and_preserves_colliding_outputs(monkeypatch, tmp_path, document_server):
+    document_server["delay"] = 0.05
+    document_server["html"] = b'''<div id="page1" style="width:40px;height:60px">
+        <img class="absimg" src="/image.png" style="width:40px;height:60px"></div>
+        <script>
+          new Scribd.EmbedsShow("#embed", {document: {title: "Test Manual", page_count: 1}});
+          docManager.addPage({pageNum: 1});
+          docManager.allPagesAdded();
+        </script>'''
+
+    async def download(session, url, **kwargs):
+        return await pages._download_pdf(session, document_server["url"], **kwargs)
+
+    monkeypatch.setattr(cli, "_download_pdf", download)
+    documents = [(f"https://www.scribd.com/doc/{number}", str(number)) for number in range(1, 7)]
+    assert asyncio.run(cli._download_batch(documents, tmp_path, 2)) == (6, 0)
+    assert document_server["peak"] == 2
+    outputs = sorted(tmp_path.glob("*.pdf"))
+    assert len(outputs) == 6
+    assert all(len(PdfReader(pdf).pages) == 1 for pdf in outputs)
 
 
 def test_long_unicode_title_fits_filesystem_filename_limit(monkeypatch, tmp_path):

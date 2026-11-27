@@ -36,6 +36,10 @@ for an image. Title-based filenames receive a numeric suffix on collisions.
 On POSIX, title-based output paths need a filesystem that supports hard links.
 An explicit output path replaces the file at that path.
 
+Batch mode works on up to four documents at once and reports progress by
+document. The batch shares one HTTP connection pool and one request limit.
+Use `-j` to set that limit (default 32).
+
 HTTP 429 and HTTP 503 with a valid `Retry-After` pause requests to the responding
 origin while other origins continue. The downloader retries up to three times.
 A 429 without a usable header uses exponential backoff with jitter. If the

@@ -71,11 +71,6 @@ def browser(monkeypatch):
         navigation_error=False,
     )
 
-    async def ensure():
-        pass
-
-    monkeypatch.setattr(pages, "_ensure_chromium", ensure)
-
     class Page:
         main_frame = object()
 
@@ -154,3 +149,19 @@ def test_navigation_timeout_closes_browser(browser):
     with pytest.raises(RuntimeError, match="did not complete successfully"):
         asyncio.run(pages._pass_client_challenge("https://www.scribd.com/embeds/1/content", 0.01))
     assert browser.closed
+
+
+def test_shared_session_checks_chromium_once(monkeypatch):
+    calls = []
+
+    async def ensure():
+        calls.append(None)
+        await asyncio.sleep(0)
+
+    async def run():
+        async with pages._DownloadSession() as session:
+            await asyncio.gather(session.ensure_chromium(), session.ensure_chromium())
+
+    monkeypatch.setattr(pages, "_ensure_chromium", ensure)
+    asyncio.run(run())
+    assert len(calls) == 1
